@@ -1,0 +1,12 @@
+.cursor/
+.git/
+.gitignore
+bin/
+dist/
+node_modules/
+*.log
+*.tmp
+*.swp
+*.swo
+.env
+
