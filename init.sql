@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS tokens (
 );
 
 CREATE TABLE IF NOT EXISTS user_history (
-  id SERIAL PRIMARY KEY,
+  id BIGSERIAL PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   username TEXT,
   discriminator TEXT,
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS user_history (
 );
 
 CREATE TABLE IF NOT EXISTS username_history (
-  id SERIAL PRIMARY KEY,
+  id BIGSERIAL PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   username TEXT,
   discriminator TEXT,
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS username_history (
 );
 
 CREATE TABLE IF NOT EXISTS avatar_history (
-  id SERIAL PRIMARY KEY,
+  id BIGSERIAL PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   hash_avatar TEXT,
   url_cdn TEXT,
@@ -47,19 +47,20 @@ CREATE TABLE IF NOT EXISTS avatar_history (
 );
 
 CREATE TABLE IF NOT EXISTS bio_history (
-  id SERIAL PRIMARY KEY,
+  id BIGSERIAL PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   bio_content TEXT,
   changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS connected_accounts (
-  id SERIAL PRIMARY KEY,
+  id BIGSERIAL PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   type TEXT NOT NULL,
   external_id TEXT,
   name TEXT,
-  observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, type, external_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_username_history_user_id

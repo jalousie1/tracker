@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,7 +82,7 @@ func (s *Server) getProfile(c *gin.Context) {
 				) FROM username_history uh 
 				WHERE uh.user_id = u.id 
 				AND (uh.username IS NOT NULL OR uh.global_name IS NOT NULL)
-				LIMIT 500
+				LIMIT 25
 				), '[]'::json
 			) as username_history,
 			COALESCE(
@@ -93,7 +94,7 @@ func (s *Server) getProfile(c *gin.Context) {
 					) ORDER BY ah.changed_at DESC
 				) FROM avatar_history ah 
 				WHERE ah.user_id = u.id 
-				LIMIT 500
+				LIMIT 25
 				), '[]'::json
 			) as avatar_history,
 			COALESCE(
@@ -104,7 +105,7 @@ func (s *Server) getProfile(c *gin.Context) {
 					) ORDER BY bh.changed_at DESC
 				) FROM bio_history bh 
 				WHERE bh.user_id = u.id 
-				LIMIT 500
+				LIMIT 25
 				), '[]'::json
 			) as bio_history,
 			COALESCE(
@@ -118,7 +119,7 @@ func (s *Server) getProfile(c *gin.Context) {
 					) ORDER BY ca.observed_at DESC
 				) FROM connected_accounts ca 
 				WHERE ca.user_id = u.id 
-				LIMIT 500
+				LIMIT 25
 				), '[]'::json
 			) as connections,
 			COALESCE(
@@ -133,7 +134,7 @@ func (s *Server) getProfile(c *gin.Context) {
 				) FROM nickname_history nh 
 				LEFT JOIN guilds g ON g.guild_id = nh.guild_id
 				WHERE nh.user_id = u.id 
-				LIMIT 500
+				LIMIT 25
 				), '[]'::json
 			) as nickname_history,
 			COALESCE(
@@ -151,29 +152,48 @@ func (s *Server) getProfile(c *gin.Context) {
 					WHERE user_id = u.id
 				) gm
 				LEFT JOIN guilds g ON g.guild_id = gm.guild_id
-				LIMIT 100
+				LIMIT 20
 				), '[]'::json
 			) as guilds,
 			COALESCE(
 				(SELECT json_agg(
 					json_build_object(
 						'guild_id', vs.guild_id,
-						'guild_name', COALESCE(g.name, vs.guild_id),
+						'guild_name', COALESCE(vs.guild_name, g.name, vs.guild_id),
 						'guild_icon', g.icon,
 						'channel_id', vs.channel_id,
-						'channel_name', vs.channel_name,
+						'channel_name', COALESCE(vs.channel_name, ch.name, vs.channel_id),
 						'joined_at', vs.joined_at,
 						'left_at', vs.left_at,
 						'duration_seconds', vs.duration_seconds,
 						'was_video', vs.was_video,
 						'was_streaming', vs.was_streaming,
 						'was_muted', vs.was_muted,
-						'was_deafened', vs.was_deafened
+						'was_deafened', vs.was_deafened,
+						'participants', COALESCE(
+							(SELECT json_agg(json_build_object(
+								'user_id', vp.user_id,
+								'username', COALESCE(
+									(SELECT uh.global_name FROM username_history uh WHERE uh.user_id = vp.user_id ORDER BY uh.changed_at DESC LIMIT 1),
+									(SELECT uh.username FROM username_history uh WHERE uh.user_id = vp.user_id ORDER BY uh.changed_at DESC LIMIT 1),
+									vp.user_id
+								),
+								'avatar_hash', (SELECT ah.hash_avatar FROM avatar_history ah WHERE ah.user_id = vp.user_id ORDER BY ah.changed_at DESC LIMIT 1)
+							))
+							FROM voice_participants vp
+							WHERE vp.session_id = vs.id
+							), '[]'::json
+						)
 					) ORDER BY vs.joined_at DESC
-				) FROM voice_sessions vs 
+				) FROM (
+					SELECT DISTINCT ON (guild_id, channel_id, floor(extract(epoch from joined_at) / 2)) *
+					FROM voice_sessions 
+					WHERE user_id = u.id
+					ORDER BY guild_id, channel_id, floor(extract(epoch from joined_at) / 2), joined_at DESC
+				) vs 
 				LEFT JOIN guilds g ON g.guild_id = vs.guild_id
-				WHERE vs.user_id = u.id 
-				LIMIT 100
+				LEFT JOIN channels ch ON ch.channel_id = vs.channel_id
+				LIMIT 25
 				), '[]'::json
 			) as voice_history,
 			COALESCE(
@@ -185,7 +205,7 @@ func (s *Server) getProfile(c *gin.Context) {
 					) ORDER BY ph.changed_at DESC
 				) FROM presence_history ph 
 				WHERE ph.user_id = u.id 
-				LIMIT 500
+				LIMIT 25
 				), '[]'::json
 			) as presence_history,
 			COALESCE(
@@ -205,7 +225,7 @@ func (s *Server) getProfile(c *gin.Context) {
 					) ORDER BY ah.started_at DESC
 				) FROM activity_history ah 
 				WHERE ah.user_id = u.id 
-				LIMIT 100
+				LIMIT 20
 				), '[]'::json
 			) as activity_history,
 			COALESCE(
@@ -227,7 +247,7 @@ func (s *Server) getProfile(c *gin.Context) {
 				LEFT JOIN guilds g ON g.guild_id = m.guild_id
 				LEFT JOIN channels ch ON ch.channel_id = m.channel_id
 				WHERE m.user_id = u.id 
-				LIMIT 100
+				LIMIT 20
 				), '[]'::json
 			) as messages,
 			COALESCE(
@@ -250,7 +270,7 @@ func (s *Server) getProfile(c *gin.Context) {
 				) FROM voice_partner_stats vps
 				LEFT JOIN guilds g ON g.guild_id = vps.guild_id
 				WHERE vps.user_id = u.id 
-				LIMIT 50
+				LIMIT 15
 				), '[]'::json
 			) as voice_partners,
 			COALESCE(
@@ -263,7 +283,7 @@ func (s *Server) getProfile(c *gin.Context) {
 					) ORDER BY bh.changed_at DESC
 				) FROM banner_history bh 
 				WHERE bh.user_id = u.id 
-				LIMIT 100
+				LIMIT 20
 				), '[]'::json
 			) as banner_history,
 			COALESCE(
@@ -275,7 +295,7 @@ func (s *Server) getProfile(c *gin.Context) {
 					) ORDER BY ch.changed_at DESC
 				) FROM clan_history ch 
 				WHERE ch.user_id = u.id 
-				LIMIT 100
+				LIMIT 20
 				), '[]'::json
 			) as clan_history,
 			COALESCE(
@@ -287,7 +307,7 @@ func (s *Server) getProfile(c *gin.Context) {
 					) ORDER BY adh.changed_at DESC
 				) FROM avatar_decoration_history adh 
 				WHERE adh.user_id = u.id 
-				LIMIT 100
+				LIMIT 20
 				), '[]'::json
 			) as avatar_decoration_history
 		FROM users u
@@ -521,20 +541,62 @@ func (s *Server) getProfile(c *gin.Context) {
 	var messages, voicePartners []interface{}
 	var bannerHistory, clanHistory, avatarDecorationHistory []interface{}
 
-	json.Unmarshal(usernameHistoryJSON, &usernameHistory)
-	json.Unmarshal(avatarHistoryJSON, &avatarHistory)
-	json.Unmarshal(bioHistoryJSON, &bioHistory)
-	json.Unmarshal(connectionsJSON, &connections)
-	json.Unmarshal(nicknameHistoryJSON, &nicknameHistory)
-	json.Unmarshal(guildsJSON, &guilds)
-	json.Unmarshal(voiceHistoryJSON, &voiceHistory)
-	json.Unmarshal(presenceHistoryJSON, &presenceHistory)
-	json.Unmarshal(activityHistoryJSON, &activityHistory)
-	json.Unmarshal(messagesJSON, &messages)
-	json.Unmarshal(voicePartnersJSON, &voicePartners)
-	json.Unmarshal(bannerHistoryJSON, &bannerHistory)
-	json.Unmarshal(clanHistoryJSON, &clanHistory)
-	json.Unmarshal(avatarDecorationHistoryJSON, &avatarDecorationHistory)
+	if err := json.Unmarshal(usernameHistoryJSON, &usernameHistory); err != nil {
+		s.log.Warn("failed_to_unmarshal_username_history", "error", err)
+		usernameHistory = []interface{}{}
+	}
+	if err := json.Unmarshal(avatarHistoryJSON, &avatarHistory); err != nil {
+		s.log.Warn("failed_to_unmarshal_avatar_history", "error", err)
+		avatarHistory = []interface{}{}
+	}
+	if err := json.Unmarshal(bioHistoryJSON, &bioHistory); err != nil {
+		s.log.Warn("failed_to_unmarshal_bio_history", "error", err)
+		bioHistory = []interface{}{}
+	}
+	if err := json.Unmarshal(connectionsJSON, &connections); err != nil {
+		s.log.Warn("failed_to_unmarshal_connections", "error", err)
+		connections = []interface{}{}
+	}
+	if err := json.Unmarshal(nicknameHistoryJSON, &nicknameHistory); err != nil {
+		s.log.Warn("failed_to_unmarshal_nickname_history", "error", err)
+		nicknameHistory = []interface{}{}
+	}
+	if err := json.Unmarshal(guildsJSON, &guilds); err != nil {
+		s.log.Warn("failed_to_unmarshal_guilds", "error", err)
+		guilds = []interface{}{}
+	}
+	if err := json.Unmarshal(voiceHistoryJSON, &voiceHistory); err != nil {
+		s.log.Warn("failed_to_unmarshal_voice_history", "error", err)
+		voiceHistory = []interface{}{}
+	}
+	if err := json.Unmarshal(presenceHistoryJSON, &presenceHistory); err != nil {
+		s.log.Warn("failed_to_unmarshal_presence_history", "error", err)
+		presenceHistory = []interface{}{}
+	}
+	if err := json.Unmarshal(activityHistoryJSON, &activityHistory); err != nil {
+		s.log.Warn("failed_to_unmarshal_activity_history", "error", err)
+		activityHistory = []interface{}{}
+	}
+	if err := json.Unmarshal(messagesJSON, &messages); err != nil {
+		s.log.Warn("failed_to_unmarshal_messages", "error", err)
+		messages = []interface{}{}
+	}
+	if err := json.Unmarshal(voicePartnersJSON, &voicePartners); err != nil {
+		s.log.Warn("failed_to_unmarshal_voice_partners", "error", err)
+		voicePartners = []interface{}{}
+	}
+	if err := json.Unmarshal(bannerHistoryJSON, &bannerHistory); err != nil {
+		s.log.Warn("failed_to_unmarshal_banner_history", "error", err)
+		bannerHistory = []interface{}{}
+	}
+	if err := json.Unmarshal(clanHistoryJSON, &clanHistory); err != nil {
+		s.log.Warn("failed_to_unmarshal_clan_history", "error", err)
+		clanHistory = []interface{}{}
+	}
+	if err := json.Unmarshal(avatarDecorationHistoryJSON, &avatarDecorationHistory); err != nil {
+		s.log.Warn("failed_to_unmarshal_avatar_decoration_history", "error", err)
+		avatarDecorationHistory = []interface{}{}
+	}
 
 	response := gin.H{
 		"discord_id":                userID,
@@ -571,6 +633,21 @@ func (s *Server) search(c *gin.Context) {
 		return
 	}
 
+	// Pagination parameters
+	page := 1
+	limit := 50
+	if p := c.Query("page"); p != "" {
+		if parsed, err := strconv.Atoi(p); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	if l := c.Query("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 && parsed <= 100 {
+			limit = parsed
+		}
+	}
+	offset := (page - 1) * limit
+
 	ctx, cancel := s.ctx(c)
 	defer cancel()
 
@@ -589,8 +666,8 @@ func (s *Server) search(c *gin.Context) {
 		 WHERE username % $1
 		    OR global_name % $1
 		 ORDER BY similarity_score DESC, changed_at DESC
-		 LIMIT 50`,
-		q,
+		 LIMIT $2 OFFSET $3`,
+		q, limit, offset,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "db_error", "message": "falha na busca"}})
@@ -618,7 +695,7 @@ func (s *Server) search(c *gin.Context) {
 		ChangedAt  string  `json:"changed_at"`
 	}
 
-	out := make([]result, 0, 50)
+	out := make([]result, 0, limit)
 	for rows.Next() {
 		var r result
 		var changedAt time.Time
@@ -631,10 +708,21 @@ func (s *Server) search(c *gin.Context) {
 		out = append(out, r)
 	}
 
+	// Calculate pagination metadata
+	totalPages := int64(1)
+	if totalCount > 0 {
+		totalPages = (totalCount + int64(limit) - 1) / int64(limit)
+	}
+	hasMore := int64(page) < totalPages
+
 	c.JSON(http.StatusOK, gin.H{
-		"query":   q,
-		"total":   totalCount,
-		"results": out,
+		"query":    q,
+		"total":    totalCount,
+		"page":     page,
+		"limit":    limit,
+		"pages":    totalPages,
+		"has_more": hasMore,
+		"results":  out,
 	})
 }
 
@@ -764,16 +852,27 @@ func (s *Server) health(c *gin.Context) {
 	ctx, cancel := s.ctx(c)
 	defer cancel()
 
+	// Verbose mode for detailed health info
+	verbose := strings.EqualFold(c.Query("verbose"), "true") || c.Query("verbose") == "1"
+
 	// check database
-	var dbStatus string = "connected"
+	dbStatus := "connected"
+	var dbLatencyMs int64
+	dbStart := time.Now()
 	if err := s.db.Pool.Ping(ctx); err != nil {
 		dbStatus = "disconnected"
+	} else {
+		dbLatencyMs = time.Since(dbStart).Milliseconds()
 	}
 
 	// check redis
-	var redisStatus string = "connected"
+	redisStatus := "connected"
+	var redisLatencyMs int64
+	redisStart := time.Now()
 	if err := s.redis.RDB().Ping(ctx).Err(); err != nil {
 		redisStatus = "disconnected"
+	} else {
+		redisLatencyMs = time.Since(redisStart).Milliseconds()
 	}
 
 	// buscar valores reais
@@ -794,8 +893,14 @@ func (s *Server) health(c *gin.Context) {
 		eventsProcessedToday = count
 	}
 
+	// Event queue size (if event processor available)
+	var eventQueueSize int64
+	if s.ep != nil {
+		eventQueueSize = int64(len(s.ep.GetEventQueue()))
+	}
+
 	status := "healthy"
-	if dbStatus != "connected" || redisStatus != "disconnected" {
+	if dbStatus != "connected" || redisStatus != "connected" {
 		status = "unhealthy"
 	}
 
@@ -806,6 +911,35 @@ func (s *Server) health(c *gin.Context) {
 		"active_tokens":          activeTokens,
 		"active_connections":     activeConnections,
 		"events_processed_today": eventsProcessedToday,
+		"event_queue_size":       eventQueueSize,
+		"timestamp":              time.Now().UTC().Format(time.RFC3339),
+	}
+
+	// Add verbose details if requested
+	if verbose {
+		// Database stats
+		var totalUsers, totalEvents int64
+		_ = s.db.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&totalUsers)
+		_ = s.db.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM user_history`).Scan(&totalEvents)
+
+		// Pool stats
+		poolStats := s.db.Pool.Stat()
+
+		response["details"] = gin.H{
+			"latency": gin.H{
+				"database_ms": dbLatencyMs,
+				"redis_ms":    redisLatencyMs,
+			},
+			"database_stats": gin.H{
+				"total_users":   totalUsers,
+				"total_history": totalEvents,
+				"pool_acquired": poolStats.AcquiredConns(),
+				"pool_idle":     poolStats.IdleConns(),
+				"pool_total":    poolStats.TotalConns(),
+				"pool_max":      poolStats.MaxConns(),
+			},
+			"queue_capacity": 50000, // Matches event_processor.go
+		}
 	}
 
 	if status == "unhealthy" {
@@ -818,8 +952,7 @@ func (s *Server) health(c *gin.Context) {
 
 func (s *Server) addToken(c *gin.Context) {
 	var req struct {
-		Token       string `json:"token" binding:"required"`
-		OwnerUserID string `json:"owner_user_id" binding:"required"`
+		Token string `json:"token" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -833,29 +966,29 @@ func (s *Server) addToken(c *gin.Context) {
 		return
 	}
 
-	// validar user_id
-	if _, err := security.ParseSnowflake(req.OwnerUserID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "invalid_user_id", "message": "owner_user_id invalido"}})
+	ctx, cancel := s.ctx(c)
+	defer cancel()
+
+	// buscar dados da conta do token automaticamente
+	accountInfo, err := fetchTokenAccountInfo(ctx, req.Token)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "token_invalid", "message": "token invalido ou nao funciona: " + err.Error()}})
 		return
 	}
 
 	// se o tokenManager estiver disponivel, usa ele
 	if s.tokenManager != nil {
-		if err := s.tokenManager.AddToken(req.Token, req.OwnerUserID); err != nil {
+		if err := s.tokenManager.AddToken(req.Token, accountInfo.UserID); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "token_add_failed", "message": err.Error()}})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"success": true, "message": "token adicionado com sucesso"})
-		return
-	}
-
-	// fallback: adicionar com validacao de token
-	ctx, cancel := s.ctx(c)
-	defer cancel()
-
-	// verificar se o token funciona
-	if !validateTokenHealth(ctx, req.Token) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "token_invalid", "message": "token invalido ou nao funciona"}})
+		// atualizar account info no banco
+		_, _ = s.db.Pool.Exec(ctx,
+			`UPDATE tokens SET account_user_id = $1, account_username = $2, account_display_name = $3, account_avatar = $4 
+			 WHERE user_id = $1 ORDER BY id DESC LIMIT 1`,
+			accountInfo.UserID, accountInfo.Username, accountInfo.DisplayName, accountInfo.Avatar,
+		)
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "token adicionado com sucesso", "account": accountInfo})
 		return
 	}
 
@@ -883,14 +1016,19 @@ func (s *Server) addToken(c *gin.Context) {
 	if hasFingerprint {
 		fingerprint := discord.TokenFingerprintForAPI(req.Token)
 		_, err = s.db.Pool.Exec(ctx,
-			`INSERT INTO tokens (token, token_encrypted, token_fingerprint, user_id, status, created_at)
-			 VALUES ($1, $2, $3, $4, 'ativo', NOW())`,
-			encrypted, encrypted, fingerprint, req.OwnerUserID,
+			`INSERT INTO tokens (token, token_encrypted, token_fingerprint, user_id, status, created_at,
+			 account_user_id, account_username, account_display_name, account_avatar)
+			 VALUES ($1, $2, $3, $4, 'ativo', NOW(), $5, $6, $7, $8)`,
+			encrypted, encrypted, fingerprint, accountInfo.UserID,
+			accountInfo.UserID, accountInfo.Username, accountInfo.DisplayName, accountInfo.Avatar,
 		)
 	} else {
 		_, err = s.db.Pool.Exec(ctx,
-			`INSERT INTO tokens (token, token_encrypted, user_id, status, created_at) VALUES ($1, $2, $3, 'ativo', NOW())`,
-			encrypted, encrypted, req.OwnerUserID,
+			`INSERT INTO tokens (token, token_encrypted, user_id, status, created_at,
+			 account_user_id, account_username, account_display_name, account_avatar)
+			 VALUES ($1, $2, $3, 'ativo', NOW(), $4, $5, $6, $7)`,
+			encrypted, encrypted, accountInfo.UserID,
+			accountInfo.UserID, accountInfo.Username, accountInfo.DisplayName, accountInfo.Avatar,
 		)
 	}
 	if err != nil {
@@ -904,37 +1042,88 @@ func (s *Server) addToken(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "token adicionado com sucesso"})
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "token adicionado com sucesso", "account": accountInfo})
 }
 
-// validateTokenHealth verifica se o token funciona fazendo uma requisicao para a api do discord
-func validateTokenHealth(ctx context.Context, token string) bool {
+// TokenAccountInfo holds the account info fetched from Discord API
+type TokenAccountInfo struct {
+	UserID      string `json:"user_id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name,omitempty"`
+	Avatar      string `json:"avatar,omitempty"`
+}
+
+// fetchTokenAccountInfo fetches the account info from Discord using /users/@me
+func fetchTokenAccountInfo(ctx context.Context, token string) (*TokenAccountInfo, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://discord.com/api/v10/users/@me", nil)
 	if err != nil {
-		return false
+		return nil, err
 	}
 
 	req.Header.Set("Authorization", token)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	return resp.StatusCode == http.StatusOK
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("discord api returned %d", resp.StatusCode)
+	}
+
+	var data struct {
+		ID            string `json:"id"`
+		Username      string `json:"username"`
+		GlobalName    string `json:"global_name"`
+		Discriminator string `json:"discriminator"`
+		Avatar        string `json:"avatar"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+
+	return &TokenAccountInfo{
+		UserID:      data.ID,
+		Username:    data.Username,
+		DisplayName: data.GlobalName,
+		Avatar:      data.Avatar,
+	}, nil
 }
 
 func (s *Server) listTokens(c *gin.Context) {
 	ctx, cancel := s.ctx(c)
 	defer cancel()
 
-	// listar tokens diretamente do banco (funciona mesmo sem token manager)
+	// listar tokens com account info e guilds
 	rows, err := s.db.Pool.Query(ctx,
-		`SELECT id, user_id, status, failure_count, COALESCE(last_used, created_at) as last_used, suspended_until
-		 FROM tokens
-		 ORDER BY id DESC`,
+		`SELECT 
+			t.id, 
+			t.user_id, 
+			t.status, 
+			t.failure_count, 
+			COALESCE(t.last_used, t.created_at) as last_used, 
+			t.suspended_until,
+			COALESCE(t.account_username, '') as username,
+			COALESCE(t.account_display_name, '') as display_name,
+			COALESCE(t.account_avatar, '') as avatar,
+			COALESCE(
+				(SELECT json_agg(json_build_object(
+					'guild_id', g.guild_id,
+					'name', COALESCE(g.name, tg.guild_id),
+					'icon', g.icon,
+					'member_count', g.member_count
+				))
+				FROM token_guilds tg
+				LEFT JOIN guilds g ON g.guild_id = tg.guild_id
+				WHERE tg.token_id = t.id
+				), '[]'::json
+			) as guilds
+		 FROM tokens t
+		 ORDER BY t.id DESC`,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "db_error", "message": err.Error()}})
@@ -942,27 +1131,127 @@ func (s *Server) listTokens(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	type guildInfo struct {
+		GuildID     string `json:"guild_id"`
+		Name        string `json:"name"`
+		Icon        string `json:"icon,omitempty"`
+		MemberCount int    `json:"member_count,omitempty"`
+	}
+
 	type tokenResp struct {
-		ID             int64      `json:"id"`
-		Token          string     `json:"token_masked"`
-		UserID         string     `json:"user_id"`
-		Status         string     `json:"status"`
-		FailureCount   int        `json:"failure_count"`
-		LastUsed       time.Time  `json:"last_used"`
-		SuspendedUntil *time.Time `json:"suspended_until,omitempty"`
+		ID             int64       `json:"id"`
+		Token          string      `json:"token_masked"`
+		UserID         string      `json:"user_id"`
+		Username       string      `json:"username,omitempty"`
+		DisplayName    string      `json:"display_name,omitempty"`
+		Avatar         string      `json:"avatar,omitempty"`
+		Status         string      `json:"status"`
+		FailureCount   int         `json:"failure_count"`
+		LastUsed       time.Time   `json:"last_used"`
+		SuspendedUntil *time.Time  `json:"suspended_until,omitempty"`
+		Guilds         []guildInfo `json:"guilds"`
 	}
 
 	resp := make([]tokenResp, 0)
 	for rows.Next() {
 		var t tokenResp
-		if err := rows.Scan(&t.ID, &t.UserID, &t.Status, &t.FailureCount, &t.LastUsed, &t.SuspendedUntil); err != nil {
+		var guildsJSON []byte
+		if err := rows.Scan(&t.ID, &t.UserID, &t.Status, &t.FailureCount, &t.LastUsed, &t.SuspendedUntil, &t.Username, &t.DisplayName, &t.Avatar, &guildsJSON); err != nil {
+			s.log.Warn("token_scan_error", "error", err)
 			continue
 		}
 		t.Token = fmt.Sprintf("token...ID%d", t.ID)
+
+		// Parse guilds JSON
+		t.Guilds = []guildInfo{}
+		if len(guildsJSON) > 0 {
+			json.Unmarshal(guildsJSON, &t.Guilds)
+		}
+
 		resp = append(resp, t)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"tokens": resp})
+}
+
+func (s *Server) refreshTokens(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Minute)
+	defer cancel()
+
+	// buscar todos os tokens do banco
+	rows, err := s.db.Pool.Query(ctx,
+		`SELECT id, token_encrypted FROM tokens WHERE status = 'ativo'`,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "db_error", "message": err.Error()}})
+		return
+	}
+	defer rows.Close()
+
+	type tokenToUpdate struct {
+		ID             int64
+		EncryptedToken string
+	}
+
+	var tokens []tokenToUpdate
+	for rows.Next() {
+		var t tokenToUpdate
+		if err := rows.Scan(&t.ID, &t.EncryptedToken); err != nil {
+			continue
+		}
+		tokens = append(tokens, t)
+	}
+
+	updated := 0
+	failed := 0
+
+	for _, t := range tokens {
+		// decrypt token
+		decrypted, err := security.DecryptToken(t.EncryptedToken, s.cfg.EncryptionKey)
+		if err != nil {
+			s.log.Warn("token_decrypt_error", "token_id", t.ID, "error", err)
+			failed++
+			continue
+		}
+
+		// fetch account info
+		accountInfo, err := fetchTokenAccountInfo(ctx, decrypted)
+		if err != nil {
+			s.log.Warn("token_fetch_error", "token_id", t.ID, "error", err)
+			failed++
+			continue
+		}
+
+		// update database
+		_, err = s.db.Pool.Exec(ctx,
+			`UPDATE tokens SET 
+				account_user_id = $1, 
+				account_username = $2, 
+				account_display_name = $3, 
+				account_avatar = $4,
+				user_id = $1
+			 WHERE id = $5`,
+			accountInfo.UserID, accountInfo.Username, accountInfo.DisplayName, accountInfo.Avatar, t.ID,
+		)
+		if err != nil {
+			s.log.Warn("token_update_error", "token_id", t.ID, "error", err)
+			failed++
+			continue
+		}
+
+		updated++
+		s.log.Info("token_refreshed", "token_id", t.ID, "username", accountInfo.Username)
+
+		// rate limit: wait 500ms between requests
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"updated": updated,
+		"failed":  failed,
+		"total":   len(tokens),
+	})
 }
 
 func (s *Server) removeToken(c *gin.Context) {

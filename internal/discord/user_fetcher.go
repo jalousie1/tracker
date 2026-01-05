@@ -15,12 +15,14 @@ import (
 )
 
 type UserFetcher struct {
-	tokenManager *TokenManager
-	db           *db.DB
-	redis        *redis.Client
-	logger       *slog.Logger
-	httpClient   *http.Client
-	botToken     string // bot token do .env para fallback
+	tokenManager   *TokenManager
+	db             *db.DB
+	redis          *redis.Client
+	logger         *slog.Logger
+	httpClient     *http.Client
+	botToken       string // bot token do .env para fallback
+	circuitBreaker *CircuitBreaker
+	retryConfig    RetryConfig
 }
 
 type DiscordUser struct {
@@ -36,14 +38,14 @@ type DiscordUser struct {
 
 func NewUserFetcher(logger *slog.Logger, dbConn *db.DB, redisClient *redis.Client, tokenManager *TokenManager, botToken string) *UserFetcher {
 	return &UserFetcher{
-		tokenManager: tokenManager,
-		db:           dbConn,
-		redis:        redisClient,
-		logger:       logger,
-		botToken:     botToken,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		tokenManager:   tokenManager,
+		db:             dbConn,
+		redis:          redisClient,
+		logger:         logger,
+		botToken:       botToken,
+		httpClient:     DiscordHTTPClient, // Use shared optimized HTTP client
+		circuitBreaker: NewCircuitBreaker(),
+		retryConfig:    DefaultRetryConfig(),
 	}
 }
 
@@ -92,11 +94,26 @@ func (uf *UserFetcher) FetchUserByID(ctx context.Context, userID string) (*Disco
 
 // fetchWithUserToken busca usuário usando um user token específico
 func (uf *UserFetcher) fetchWithUserToken(ctx context.Context, userID string, tokenEntry *TokenEntry) (*DiscordUser, error) {
+	// Check circuit breaker first
+	if !uf.circuitBreaker.Allow() {
+		uf.logger.Warn("circuit_breaker_open", "user_id", userID, "state", uf.circuitBreaker.StateString())
+		return nil, fmt.Errorf("circuit_breaker_open: Discord API temporarily unavailable")
+	}
+
 	var resp *http.Response
 	var lastErr error
-	maxRetries := 3
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := 0; attempt < uf.retryConfig.MaxRetries; attempt++ {
+		// Verificar se contexto foi cancelado antes de cada tentativa
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return nil, fmt.Errorf("context_cancelled: %w", lastErr)
+			}
+			return nil, ctx.Err()
+		default:
+		}
+
 		url := fmt.Sprintf("https://discord.com/api/v10/users/%s", userID)
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
@@ -110,26 +127,34 @@ func (uf *UserFetcher) fetchWithUserToken(ctx context.Context, userID string, to
 
 		resp, err = uf.httpClient.Do(req)
 		if err != nil {
-			uf.logger.Warn("api_request_failed", "user_id", userID, "error", err)
+			uf.circuitBreaker.RecordFailure()
+			uf.logger.Warn("api_request_failed", "user_id", userID, "error", err, "attempt", attempt+1)
 			lastErr = fmt.Errorf("request_failed: %w", err)
+
+			// Exponential backoff before retry
+			backoff := CalculateBackoff(uf.retryConfig, attempt, 0)
+			time.Sleep(backoff)
 			continue
 		}
 
-		// Se rate limited (429), esperar e tentar novamente
+		// Se rate limited (429), usar exponential backoff com Retry-After
 		if resp.StatusCode == http.StatusTooManyRequests {
-			retryAfter := 1.0
+			uf.circuitBreaker.RecordFailure()
+			var retryAfter time.Duration
 			if ra := resp.Header.Get("Retry-After"); ra != "" {
 				if parsed, parseErr := time.ParseDuration(ra + "s"); parseErr == nil {
-					retryAfter = parsed.Seconds()
+					retryAfter = parsed
 				}
 			}
-			retryAfter += 0.5
-			uf.logger.Warn("rate_limited", "user_id", userID, "retry_after", retryAfter, "attempt", attempt+1)
+			backoff := CalculateBackoff(uf.retryConfig, attempt, retryAfter)
+			uf.logger.Warn("rate_limited", "user_id", userID, "backoff", backoff.String(), "attempt", attempt+1)
 			resp.Body.Close()
-			time.Sleep(time.Duration(retryAfter * float64(time.Second)))
+			time.Sleep(backoff)
 			continue
 		}
 
+		// Success - record it
+		uf.circuitBreaker.RecordSuccess()
 		break
 	}
 
@@ -196,37 +221,43 @@ func (uf *UserFetcher) SaveUserToDatabase(ctx context.Context, user *DiscordUser
 
 	// salvar username history se houver mudanca
 	if user.Username != "" || user.GlobalName != "" {
-		var discriminator *string
-		if user.Discriminator != "" && user.Discriminator != "0" {
-			discriminator = &user.Discriminator
-		}
-
-		var username, globalName *string
-		if user.Username != "" {
-			username = &user.Username
-		}
-		if user.GlobalName != "" {
-			globalName = &user.GlobalName
-		}
-
-		// verificar se ja existe
-		var exists bool
+		// buscar os valores atuais para evitar 'vazio' em updates parciais
+		var currUsername, currGlobalName, currDisc *string
 		_ = uf.db.Pool.QueryRow(ctx,
-			`SELECT EXISTS(
-				SELECT 1 FROM username_history 
-				WHERE user_id = $1 AND username IS NOT DISTINCT FROM $2 
-				AND discriminator IS NOT DISTINCT FROM $3 
-				AND global_name IS NOT DISTINCT FROM $4
-				LIMIT 1
-			)`,
-			user.ID, username, discriminator, globalName,
-		).Scan(&exists)
+			`SELECT username, global_name, discriminator 
+			 FROM username_history 
+			 WHERE user_id = $1 
+			 ORDER BY changed_at DESC LIMIT 1`,
+			user.ID,
+		).Scan(&currUsername, &currGlobalName, &currDisc)
 
-		if !exists {
+		// preparar novos valores
+		newUsername := currUsername
+		if user.Username != "" {
+			newUsername = &user.Username
+		}
+		newGlobalName := currGlobalName
+		if user.GlobalName != "" {
+			newGlobalName = &user.GlobalName
+		}
+		newDisc := currDisc
+		if user.Discriminator != "" && user.Discriminator != "0" {
+			newDisc = &user.Discriminator
+		}
+
+		// so inserir se algo mudou E nao estamos limpando valores (vazio)
+		// se o novo valor for vazio mas o antigo nao, ignoramos a mudanca no historico
+		if (newUsername != nil || newGlobalName != nil) && ((newUsername != nil && currUsername == nil) ||
+			(newUsername != nil && currUsername != nil && *newUsername != *currUsername) ||
+			(newGlobalName != nil && currGlobalName == nil) ||
+			(newGlobalName != nil && currGlobalName != nil && *newGlobalName != *currGlobalName) ||
+			(newDisc != nil && currDisc == nil) ||
+			(newDisc != nil && currDisc != nil && *newDisc != *currDisc)) {
+
 			_, err = uf.db.Pool.Exec(ctx,
 				`INSERT INTO username_history (user_id, username, discriminator, global_name, changed_at)
 				 VALUES ($1, $2, $3, $4, NOW())`,
-				user.ID, username, discriminator, globalName,
+				user.ID, newUsername, newDisc, newGlobalName,
 			)
 			if err != nil {
 				uf.logger.Warn("failed_to_save_username_history", "user_id", user.ID, "error", err)
@@ -400,9 +431,18 @@ func (uf *UserFetcher) fetchWithBotToken(ctx context.Context, userID string) (*D
 
 	var resp *http.Response
 	var lastErr error
-	maxRetries := 3
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := 0; attempt < uf.retryConfig.MaxRetries; attempt++ {
+		// Verificar se contexto foi cancelado antes de cada tentativa
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return nil, fmt.Errorf("context_cancelled: %w", lastErr)
+			}
+			return nil, ctx.Err()
+		default:
+		}
+
 		url := fmt.Sprintf("https://discord.com/api/v10/users/%s", userID)
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
@@ -414,26 +454,34 @@ func (uf *UserFetcher) fetchWithBotToken(ctx context.Context, userID string) (*D
 
 		resp, err = uf.httpClient.Do(req)
 		if err != nil {
-			uf.logger.Warn("bot_token_request_failed", "user_id", userID, "error", err)
+			uf.circuitBreaker.RecordFailure()
+			uf.logger.Warn("bot_token_request_failed", "user_id", userID, "error", err, "attempt", attempt+1)
 			lastErr = fmt.Errorf("bot_token_request_failed: %w", err)
+
+			// Exponential backoff before retry
+			backoff := CalculateBackoff(uf.retryConfig, attempt, 0)
+			time.Sleep(backoff)
 			continue
 		}
 
-		// Se rate limited (429), esperar e tentar novamente
+		// Se rate limited (429), usar exponential backoff com Retry-After
 		if resp.StatusCode == http.StatusTooManyRequests {
-			retryAfter := 1.0
+			uf.circuitBreaker.RecordFailure()
+			var retryAfter time.Duration
 			if ra := resp.Header.Get("Retry-After"); ra != "" {
 				if parsed, parseErr := time.ParseDuration(ra + "s"); parseErr == nil {
-					retryAfter = parsed.Seconds()
+					retryAfter = parsed
 				}
 			}
-			retryAfter += 0.5
-			uf.logger.Warn("bot_token_rate_limited", "user_id", userID, "retry_after", retryAfter, "attempt", attempt+1)
+			backoff := CalculateBackoff(uf.retryConfig, attempt, retryAfter)
+			uf.logger.Warn("bot_token_rate_limited", "user_id", userID, "backoff", backoff.String(), "attempt", attempt+1)
 			resp.Body.Close()
-			time.Sleep(time.Duration(retryAfter * float64(time.Second)))
+			time.Sleep(backoff)
 			continue
 		}
 
+		// Success - record it
+		uf.circuitBreaker.RecordSuccess()
 		break
 	}
 

@@ -138,7 +138,25 @@ func (s *Scraper) ScrapeGuildMembers(ctx context.Context, guildID string, conn *
 		"token_id", conn.TokenID,
 	)
 
+	// Limpar cache de membros processados após scrape para evitar memory leak
+	s.ClearGuildCache(guildID)
+
 	return nil
+}
+
+// ClearGuildCache limpa o cache de membros processados para um guild específico
+// Isso previne memory leak quando scrapeamos muitos guilds
+func (s *Scraper) ClearGuildCache(guildID string) {
+	s.membersMutex.Lock()
+	defer s.membersMutex.Unlock()
+	delete(s.processedMembers, guildID)
+}
+
+// ClearAllCache limpa todo o cache de membros processados
+func (s *Scraper) ClearAllCache() {
+	s.membersMutex.Lock()
+	defer s.membersMutex.Unlock()
+	s.processedMembers = make(map[string]map[string]bool)
 }
 
 // ProcessGuildMembersChunk processa membros de um chunk (sem token_id - compatibilidade)
@@ -315,9 +333,8 @@ func (s *Scraper) processMemberBatchWithToken(ctx context.Context, guildID strin
 		}
 	}
 
-	// Insert username history (with deduplication check)
+	// Insert username history (com INSERT WHERE NOT EXISTS para evitar 2 roundtrips)
 	if len(usernameInserts) > 0 {
-		// Process in smaller batches to check for duplicates
 		for i := 0; i < len(usernameInserts); i += 4 {
 			if i+3 < len(usernameInserts) {
 				userID := usernameInserts[i].(string)
@@ -325,81 +342,60 @@ func (s *Scraper) processMemberBatchWithToken(ctx context.Context, guildID strin
 				discriminator := usernameInserts[i+2].(*string)
 				globalName := usernameInserts[i+3].(*string)
 
-				var exists bool
-				_ = s.db.Pool.QueryRow(ctx,
-					`SELECT EXISTS(
+				_, _ = s.db.Pool.Exec(ctx,
+					`INSERT INTO username_history (user_id, username, discriminator, global_name, changed_at)
+					 SELECT $1, $2, $3, $4, NOW()
+					 WHERE NOT EXISTS (
 						SELECT 1 FROM username_history 
 						WHERE user_id = $1 AND username IS NOT DISTINCT FROM $2 
 						AND discriminator IS NOT DISTINCT FROM $3 
 						AND global_name IS NOT DISTINCT FROM $4
 						LIMIT 1
-					)`,
+					 )`,
 					userID, username, discriminator, globalName,
-				).Scan(&exists)
-
-				if !exists {
-					_, _ = s.db.Pool.Exec(ctx,
-						`INSERT INTO username_history (user_id, username, discriminator, global_name, changed_at)
-						 VALUES ($1, $2, $3, $4, NOW())`,
-						userID, username, discriminator, globalName,
-					)
-				}
+				)
 			}
 		}
 	}
 
-	// Insert avatar history (with deduplication)
+	// Insert avatar history (com INSERT WHERE NOT EXISTS para evitar 2 roundtrips)
 	if len(avatarInserts) > 0 {
 		for i := 0; i < len(avatarInserts); i += 2 {
 			if i+1 < len(avatarInserts) {
 				userID := avatarInserts[i].(string)
 				avatarHash := avatarInserts[i+1].(string)
 
-				var exists bool
-				_ = s.db.Pool.QueryRow(ctx,
-					`SELECT EXISTS(
+				_, _ = s.db.Pool.Exec(ctx,
+					`INSERT INTO avatar_history (user_id, hash_avatar, url_cdn, changed_at)
+					 SELECT $1, $2, NULL, NOW()
+					 WHERE NOT EXISTS (
 						SELECT 1 FROM avatar_history 
 						WHERE user_id = $1 AND hash_avatar = $2
 						LIMIT 1
-					)`,
+					 )`,
 					userID, avatarHash,
-				).Scan(&exists)
-
-				if !exists {
-					_, _ = s.db.Pool.Exec(ctx,
-						`INSERT INTO avatar_history (user_id, hash_avatar, url_cdn, changed_at)
-						 VALUES ($1, $2, NULL, NOW())`,
-						userID, avatarHash,
-					)
-				}
+				)
 			}
 		}
 	}
 
-	// Insert bio history (with deduplication)
+	// Insert bio history (com INSERT WHERE NOT EXISTS para evitar 2 roundtrips)
 	if len(bioInserts) > 0 {
 		for i := 0; i < len(bioInserts); i += 2 {
 			if i+1 < len(bioInserts) {
 				userID := bioInserts[i].(string)
 				bio := bioInserts[i+1].(string)
 
-				var exists bool
-				_ = s.db.Pool.QueryRow(ctx,
-					`SELECT EXISTS(
+				_, _ = s.db.Pool.Exec(ctx,
+					`INSERT INTO bio_history (user_id, bio_content, changed_at)
+					 SELECT $1, $2, NOW()
+					 WHERE NOT EXISTS (
 						SELECT 1 FROM bio_history 
 						WHERE user_id = $1 AND bio_content = $2
 						LIMIT 1
-					)`,
+					 )`,
 					userID, bio,
-				).Scan(&exists)
-
-				if !exists {
-					_, _ = s.db.Pool.Exec(ctx,
-						`INSERT INTO bio_history (user_id, bio_content, changed_at)
-						 VALUES ($1, $2, NOW())`,
-						userID, bio,
-					)
-				}
+				)
 			}
 		}
 	}

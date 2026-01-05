@@ -43,6 +43,10 @@ type TokenManager struct {
 	encryptionKey []byte
 	currentIndex  int
 	logger        *slog.Logger
+
+	// buffering de last_used para reduzir carga no DB
+	pendingLastUsed      map[int64]time.Time
+	pendingLastUsedMutex sync.Mutex
 }
 
 func NewTokenManager(logger *slog.Logger, dbConn *db.DB, redisClient *redis.Client, encryptionKey []byte) (*TokenManager, error) {
@@ -51,11 +55,12 @@ func NewTokenManager(logger *slog.Logger, dbConn *db.DB, redisClient *redis.Clie
 	}
 
 	tm := &TokenManager{
-		db:            dbConn,
-		redis:         redisClient,
-		activeTokens:  make([]TokenEntry, 0),
-		encryptionKey: encryptionKey,
-		logger:        logger,
+		db:              dbConn,
+		redis:           redisClient,
+		activeTokens:    make([]TokenEntry, 0),
+		encryptionKey:   encryptionKey,
+		logger:          logger,
+		pendingLastUsed: make(map[int64]time.Time),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -78,6 +83,9 @@ func NewTokenManager(logger *slog.Logger, dbConn *db.DB, redisClient *redis.Clie
 	// Start background reactivation job
 	go tm.StartReactivationJob()
 
+	// Iniciar flusher de last_used (a cada 1 minuto)
+	go tm.startLastUsedFlusher()
+
 	return tm, nil
 }
 
@@ -97,6 +105,9 @@ func (tm *TokenManager) loadActiveTokens(ctx context.Context) error {
 	defer tm.mutex.Unlock()
 
 	tm.activeTokens = make([]TokenEntry, 0)
+
+	// Coletar tokens para validação em background (após startup)
+	tokensToValidate := make([]TokenEntry, 0)
 
 	for rows.Next() {
 		var entry TokenEntry
@@ -123,19 +134,14 @@ func (tm *TokenManager) loadActiveTokens(ctx context.Context) error {
 			continue
 		}
 
-		// Validate token format (basic check)
+		// Validate token format (basic check - rápido, pode ficar síncrono)
 		if !tm.validateTokenFormat(decrypted) {
 			tm.logger.Warn("invalid_token_format", "token_id", entry.ID)
 			continue
 		}
 
-		// Health check
-		if !tm.validateTokenHealth(ctx, decrypted) {
-			tm.logger.Warn("token_failed_health_check", "token_id", entry.ID)
-			// Mark as banned but don't add to pool
-			_ = tm.markTokenAsBannedDB(ctx, entry.ID, "health_check_failed")
-			continue
-		}
+		// NÃO fazer health check síncrono aqui - muito lento no startup
+		// Adicionar ao pool imediatamente e validar em background
 
 		entry.EncryptedValue = encryptedValue
 		entry.DecryptedValue = decrypted
@@ -148,9 +154,38 @@ func (tm *TokenManager) loadActiveTokens(ctx context.Context) error {
 		tm.logger.Info("token_loaded", "token_id", entry.ID, "token", masked, "user_id", entry.UserID)
 
 		tm.activeTokens = append(tm.activeTokens, entry)
+		tokensToValidate = append(tokensToValidate, entry)
+	}
+
+	// Validar tokens em background para não travar startup
+	if len(tokensToValidate) > 0 {
+		go tm.validateTokensInBackground(tokensToValidate)
 	}
 
 	return nil
+}
+
+// validateTokensInBackground valida tokens após startup para remover tokens inválidos
+func (tm *TokenManager) validateTokensInBackground(tokens []TokenEntry) {
+	// Aguardar um pouco para não sobrecarregar logo após startup
+	time.Sleep(10 * time.Second)
+
+	tm.logger.Info("background_token_validation_starting", "count", len(tokens))
+
+	for _, entry := range tokens {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+		if !tm.validateTokenHealth(ctx, entry.DecryptedValue) {
+			tm.logger.Warn("token_failed_background_health_check", "token_id", entry.ID)
+			_ = tm.markTokenAsBannedDB(ctx, entry.ID, "health_check_failed")
+		}
+		cancel()
+
+		// Rate limiting entre validações
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	tm.logger.Info("background_token_validation_completed")
 }
 
 func (tm *TokenManager) validateTokenFormat(token string) bool {
@@ -225,16 +260,15 @@ func (tm *TokenManager) GetNextAvailableToken() (*TokenEntry, error) {
 			continue
 		}
 
-		// Update last used
+		// Update last used (bufferizado em memória)
 		entry.LastUsed = time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, _ = tm.db.Pool.Exec(ctx,
-			`UPDATE tokens SET last_used = NOW() WHERE id = $1`,
-			entry.ID,
-		)
-		cancel()
+		tm.pendingLastUsedMutex.Lock()
+		tm.pendingLastUsed[entry.ID] = entry.LastUsed
+		tm.pendingLastUsedMutex.Unlock()
 
-		return entry, nil
+		// Retornar cópia do entry para evitar race conditions após unlock
+		entryCopy := *entry
+		return &entryCopy, nil
 	}
 
 	// All tokens are suspended, wait and retry
@@ -723,4 +757,41 @@ func (tm *TokenManager) GetTokenByID(tokenID int64) (*TokenEntry, error) {
 	}
 
 	return nil, errors.New("token_not_found_or_inactive")
+}
+
+func (tm *TokenManager) startLastUsedFlusher() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		tm.flushLastUsed()
+	}
+}
+
+func (tm *TokenManager) flushLastUsed() {
+	tm.pendingLastUsedMutex.Lock()
+	if len(tm.pendingLastUsed) == 0 {
+		tm.pendingLastUsedMutex.Unlock()
+		return
+	}
+
+	// Copiar IDs para flush
+	ids := make([]int64, 0, len(tm.pendingLastUsed))
+	for id := range tm.pendingLastUsed {
+		ids = append(ids, id)
+	}
+	// Limpar buffer
+	tm.pendingLastUsed = make(map[int64]time.Time)
+	tm.pendingLastUsedMutex.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := tm.db.Pool.Exec(ctx,
+		`UPDATE tokens SET last_used = NOW() WHERE id = ANY($1)`,
+		ids,
+	)
+	if err != nil {
+		tm.logger.Error("failed_to_flush_last_used", "error", err, "tokens_count", len(ids))
+	}
 }

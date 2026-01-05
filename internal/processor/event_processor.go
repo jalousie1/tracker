@@ -48,7 +48,7 @@ func NewEventProcessor(log *slog.Logger, dbConn *db.DB, redisClient *redis.Clien
 		db:         dbConn,
 		redis:      redisClient,
 		storage:    storageClient,
-		eventQueue: make(chan Event, 500000),
+		eventQueue: make(chan Event, 50000),
 		workerPool: make([]*Worker, 0),
 	}
 
@@ -113,7 +113,6 @@ func (ep *EventProcessor) runWorker(worker *Worker) {
 
 func (ep *EventProcessor) StopWorkers() {
 	ep.mu.Lock()
-	defer ep.mu.Unlock()
 
 	for _, worker := range ep.workerPool {
 		select {
@@ -122,8 +121,15 @@ func (ep *EventProcessor) StopWorkers() {
 		}
 	}
 
+	// Liberar mutex antes de esperar para evitar deadlock
+	ep.mu.Unlock()
+
 	ep.wg.Wait()
 	ep.log.Info("all_workers_stopped")
+}
+
+func (ep *EventProcessor) getDataMap(event Event) map[string]interface{} {
+	return event.Data
 }
 
 func (ep *EventProcessor) ProcessEvent(ctx context.Context, event Event) error {
@@ -136,7 +142,7 @@ func (ep *EventProcessor) ProcessEvent(ctx context.Context, event Event) error {
 		if err == nil && exists > 0 {
 			return nil // Duplicate, skip
 		}
-		_ = ep.redis.RDB().Set(ctx, dedupKey, "1", 2*time.Second).Err()
+		_ = ep.redis.RDB().Set(ctx, dedupKey, "1", 60*time.Second).Err()
 	}
 
 	switch event.Type {
@@ -156,8 +162,10 @@ func (ep *EventProcessor) ProcessEvent(ctx context.Context, event Event) error {
 		return ep.HandleTypingStart(ctx, event)
 	case "GUILD_MEMBER_ADD":
 		return ep.HandleGuildMemberAdd(ctx, event)
-	case "GUILD_CREATE":
+	case "GUILD_CREATE", "GUILD_UPDATE":
 		return ep.HandleGuildCreate(ctx, event)
+	case "CHANNEL_CREATE", "CHANNEL_UPDATE":
+		return ep.HandleChannelCreateUpdate(ctx, event)
 	default:
 		ep.log.Debug("unknown_event_type", "type", event.Type)
 		return nil
@@ -166,7 +174,9 @@ func (ep *EventProcessor) ProcessEvent(ctx context.Context, event Event) error {
 
 func (ep *EventProcessor) buildDedupKey(event Event) string {
 	userID := extractEventUserID(event)
-	guildID := extractStringField(event.Data, "guild_id")
+
+	var guildID string
+	guildID = extractStringField(event.Data, "guild_id")
 
 	// Special-case chunk events: no user_id, but a `nonce` can identify a scrape session.
 	if userID == "" {

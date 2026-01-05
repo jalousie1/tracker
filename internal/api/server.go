@@ -94,6 +94,7 @@ func NewServerWithManagers(log *slog.Logger, dbConn *db.DB, redisClient *redis.C
 			admin.GET("/tokens", s.listTokens)
 			admin.POST("/tokens", s.addToken)
 			admin.DELETE("/tokens/:id", s.removeToken)
+			admin.POST("/refresh-tokens", s.refreshTokens)
 			admin.POST("/fetch-user/:discord_id", s.fetchUser)
 		}
 	}

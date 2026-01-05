@@ -2,7 +2,6 @@ package discord
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -125,9 +124,13 @@ func (gm *GatewayManager) cleanupExpiredTrackers() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
+	const maxGuildChunkTrackers = 500 // limite máximo para evitar memory leak
+
 	for range ticker.C {
 		gm.guildChunksMutex.Lock()
 		now := time.Now()
+
+		// Primeiro: remover trackers expirados (30 segundos sem chunks)
 		for key, tracker := range gm.guildChunks {
 			// se nao recebeu chunk ha mais de 30 segundos, considerar sessao finalizada
 			if now.Sub(tracker.LastChunkAt) > 30*time.Second {
@@ -143,6 +146,25 @@ func (gm *GatewayManager) cleanupExpiredTrackers() {
 				delete(gm.guildChunks, key)
 			}
 		}
+
+		// Segundo: se ainda exceder limite, remover os trackers mais antigos
+		if len(gm.guildChunks) > maxGuildChunkTrackers {
+			// Encontrar e remover os mais antigos (metade do excedente)
+			toRemove := len(gm.guildChunks) - maxGuildChunkTrackers/2
+			removed := 0
+			for key, tracker := range gm.guildChunks {
+				if removed >= toRemove {
+					break
+				}
+				gm.logger.Warn("chunk_tracker_force_cleanup",
+					"guild_id", tracker.GuildID,
+					"reason", "max_trackers_exceeded",
+				)
+				delete(gm.guildChunks, key)
+				removed++
+			}
+		}
+
 		gm.guildChunksMutex.Unlock()
 	}
 }
@@ -807,24 +829,10 @@ func (gm *GatewayManager) HandleEvent(tokenID int64, eventType string, data map[
 		return
 	}
 
-	eventDataBytes, err := json.Marshal(data)
-	if err != nil {
-		gm.logger.Warn("failed_to_marshal_event",
-			"token_id", tokenID,
-			"event_type", eventType,
-			"error", err,
-		)
-		return
-	}
-
-	var eventData map[string]interface{}
-	if err := json.Unmarshal(eventDataBytes, &eventData); err != nil {
-		return
-	}
-
+	// data já é map[string]interface{}, não precisa serializar/deserializar
 	event := processor.Event{
 		Type:      eventType,
-		Data:      eventData,
+		Data:      data,
 		Timestamp: time.Now(),
 		TokenID:   tokenID,
 	}

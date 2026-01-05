@@ -7,7 +7,11 @@ import (
 )
 
 func (ep *EventProcessor) HandleUserUpdate(ctx context.Context, event Event) error {
-	userData, ok := event.Data["user"].(map[string]interface{})
+	data := ep.getDataMap(event)
+	if data == nil {
+		return fmt.Errorf("data is not a map in USER_UPDATE")
+	}
+	userData, ok := data["user"].(map[string]interface{})
 	if !ok {
 		return fmt.Errorf("invalid user data in USER_UPDATE")
 	}
@@ -90,7 +94,11 @@ func (ep *EventProcessor) HandleUserUpdate(ctx context.Context, event Event) err
 }
 
 func (ep *EventProcessor) HandleGuildMemberUpdate(ctx context.Context, event Event) error {
-	userData, ok := event.Data["user"].(map[string]interface{})
+	data := ep.getDataMap(event)
+	if data == nil {
+		return nil
+	}
+	userData, ok := data["user"].(map[string]interface{})
 	if !ok {
 		return fmt.Errorf("invalid user data in GUILD_MEMBER_UPDATE")
 	}
@@ -100,7 +108,7 @@ func (ep *EventProcessor) HandleGuildMemberUpdate(ctx context.Context, event Eve
 		return fmt.Errorf("missing user id")
 	}
 
-	guildID, _ := event.Data["guild_id"].(string)
+	guildID, _ := data["guild_id"].(string)
 
 	// Extract user fields
 	var username, discriminator, globalName, avatarHash *string
@@ -462,75 +470,49 @@ func (ep *EventProcessor) HandleGuildMembersChunk(ctx context.Context, event Eve
 // Helper functions
 
 func (ep *EventProcessor) handleUsernameChange(ctx context.Context, userID string, username, discriminator, globalName *string) error {
-	// Check if this exact combination already exists
-	var exists bool
-	err := ep.db.Pool.QueryRow(ctx,
-		`SELECT EXISTS(
+	// Usar INSERT com WHERE NOT EXISTS para evitar 2 roundtrips ao database
+	_, err := ep.db.Pool.Exec(ctx,
+		`INSERT INTO username_history (user_id, username, discriminator, global_name, changed_at)
+		 SELECT $1, $2, $3, $4, NOW()
+		 WHERE NOT EXISTS (
 			SELECT 1 FROM username_history 
 			WHERE user_id = $1 AND username IS NOT DISTINCT FROM $2 
 			AND discriminator IS NOT DISTINCT FROM $3 
 			AND global_name IS NOT DISTINCT FROM $4
 			LIMIT 1
-		)`,
+		 )`,
 		userID, username, discriminator, globalName,
-	).Scan(&exists)
-
-	if err == nil && !exists {
-		_, err = ep.db.Pool.Exec(ctx,
-			`INSERT INTO username_history (user_id, username, discriminator, global_name, changed_at)
-			 VALUES ($1, $2, $3, $4, NOW())`,
-			userID, username, discriminator, globalName,
-		)
-	}
-
+	)
 	return err
 }
 
 func (ep *EventProcessor) handleAvatarChange(ctx context.Context, userID, avatarHash string) error {
-	// Check if this avatar already exists
-	var exists bool
-	err := ep.db.Pool.QueryRow(ctx,
-		`SELECT EXISTS(
+	// Usar INSERT com WHERE NOT EXISTS para evitar 2 roundtrips ao database
+	_, err := ep.db.Pool.Exec(ctx,
+		`INSERT INTO avatar_history (user_id, hash_avatar, url_cdn, changed_at)
+		 SELECT $1, $2, NULL, NOW()
+		 WHERE NOT EXISTS (
 			SELECT 1 FROM avatar_history 
 			WHERE user_id = $1 AND hash_avatar = $2
 			LIMIT 1
-		)`,
+		 )`,
 		userID, avatarHash,
-	).Scan(&exists)
-
-	if err == nil && !exists {
-		// Download and upload avatar (async, will be handled by storage client)
-		// For now, just insert with NULL cdn_url
-		_, err = ep.db.Pool.Exec(ctx,
-			`INSERT INTO avatar_history (user_id, hash_avatar, url_cdn, changed_at)
-			 VALUES ($1, $2, NULL, NOW())`,
-			userID, avatarHash,
-		)
-	}
-
+	)
 	return err
 }
 
 func (ep *EventProcessor) handleBioChange(ctx context.Context, userID, bio string) error {
-	// Check if this bio already exists
-	var exists bool
-	err := ep.db.Pool.QueryRow(ctx,
-		`SELECT EXISTS(
+	// Usar INSERT com WHERE NOT EXISTS para evitar 2 roundtrips ao database
+	_, err := ep.db.Pool.Exec(ctx,
+		`INSERT INTO bio_history (user_id, bio_content, changed_at)
+		 SELECT $1, $2, NOW()
+		 WHERE NOT EXISTS (
 			SELECT 1 FROM bio_history 
 			WHERE user_id = $1 AND bio_content = $2
 			LIMIT 1
-		)`,
+		 )`,
 		userID, bio,
-	).Scan(&exists)
-
-	if err == nil && !exists {
-		_, err = ep.db.Pool.Exec(ctx,
-			`INSERT INTO bio_history (user_id, bio_content, changed_at)
-			 VALUES ($1, $2, NOW())`,
-			userID, bio,
-		)
-	}
-
+	)
 	return err
 }
 
@@ -543,42 +525,14 @@ func (ep *EventProcessor) handleConnectedAccount(ctx context.Context, userID str
 		return nil
 	}
 
-	// garantir que o usuario existe antes de tentar salvar connected_account
 	_, err := ep.db.Pool.Exec(ctx,
-		`INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`,
-		userID,
+		`INSERT INTO connected_accounts (user_id, type, external_id, name, observed_at, last_seen_at)
+		 VALUES ($1, $2, $3, $4, NOW(), NOW())
+		 ON CONFLICT (user_id, type, external_id) DO UPDATE SET 
+			last_seen_at = NOW(),
+			name = EXCLUDED.name`,
+		userID, accType, externalID, name,
 	)
-	if err != nil {
-		ep.log.Warn("failed_to_ensure_user_exists", "user_id", userID, "error", err)
-		return err
-	}
-
-	// Check if exists, then insert or update
-	var existingID int64
-	err = ep.db.Pool.QueryRow(ctx,
-		`SELECT id FROM connected_accounts 
-		 WHERE user_id = $1 AND type = $2 AND (external_id = $3 OR (external_id IS NULL AND $3 IS NULL))
-		 LIMIT 1`,
-		userID, accType, externalID,
-	).Scan(&existingID)
-
-	if err != nil {
-		// Insert new
-		_, err = ep.db.Pool.Exec(ctx,
-			`INSERT INTO connected_accounts (user_id, type, external_id, name, observed_at, last_seen_at)
-			 VALUES ($1, $2, $3, $4, NOW(), NOW())`,
-			userID, accType, externalID, name,
-		)
-	} else {
-		// Update existing
-		_, err = ep.db.Pool.Exec(ctx,
-			`UPDATE connected_accounts 
-			 SET last_seen_at = NOW(), name = $1 
-			 WHERE id = $2`,
-			name, existingID,
-		)
-	}
-
 	return err
 }
 
@@ -769,6 +723,15 @@ func (ep *EventProcessor) HandleVoiceStateUpdate(ctx context.Context, event Even
 	selfVideo, _ := event.Data["self_video"].(bool)
 
 	if channelID != "" && guildID != "" {
+		// Garantir que não existam outras sessões ativas para este usuário em outros canais/guildas
+		// Um usuário do Discord só pode estar em uma call por vez.
+		_, _ = ep.db.Pool.Exec(ctx,
+			`UPDATE voice_sessions SET left_at = NOW(), 
+				 duration_seconds = EXTRACT(EPOCH FROM (NOW() - joined_at))::INTEGER
+			 WHERE user_id = $1 AND left_at IS NULL AND (guild_id != $2 OR channel_id != $3)`,
+			userID, guildID, channelID,
+		)
+
 		// Verificar se já existe sessão ativa para este usuário neste canal
 		var existingSessionID int64
 		err := ep.db.Pool.QueryRow(ctx,
@@ -793,49 +756,58 @@ func (ep *EventProcessor) HandleVoiceStateUpdate(ctx context.Context, event Even
 		} else {
 			// Não existe sessão ativa - criar nova sessão (usuário acabou de entrar)
 			var sessionID int64
+			var channelName, guildName *string
+			_ = ep.db.Pool.QueryRow(ctx, "SELECT name FROM channels WHERE channel_id = $1", channelID).Scan(&channelName)
+			_ = ep.db.Pool.QueryRow(ctx, "SELECT name FROM guilds WHERE guild_id = $1", guildID).Scan(&guildName)
+
 			err := ep.db.Pool.QueryRow(ctx,
-				`INSERT INTO voice_sessions (user_id, guild_id, channel_id, joined_at, was_muted, was_deafened, was_streaming, was_video)
-				 VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7)
+				`INSERT INTO voice_sessions (user_id, guild_id, guild_name, channel_id, channel_name, joined_at, was_muted, was_deafened, was_streaming, was_video)
+				 VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9)
 				 RETURNING id`,
-				userID, guildID, channelID, selfMute, selfDeaf, selfStream, selfVideo,
+				userID, guildID, guildName, channelID, channelName, selfMute, selfDeaf, selfStream, selfVideo,
 			).Scan(&sessionID)
 
 			if err == nil && sessionID > 0 {
-				// buscar outros usuarios no mesmo canal e registrar como participantes
+				// buscar outros usuarios no mesmo canal e registrar a participação cruzada
+				// 1. Encontrar todas as sessoes ativas no canal (exceto a do próprio usuário)
 				rows, _ := ep.db.Pool.Query(ctx,
-					`SELECT DISTINCT user_id FROM voice_sessions 
+					`SELECT id, user_id FROM voice_sessions 
 					 WHERE guild_id = $1 AND channel_id = $2 AND left_at IS NULL AND user_id != $3`,
 					guildID, channelID, userID,
 				)
 				if rows != nil {
 					defer rows.Close()
 					for rows.Next() {
+						var partnerSessionID int64
 						var partnerID string
-						if rows.Scan(&partnerID) == nil && partnerID != "" {
-							// registrar participante na sessao
+						if rows.Scan(&partnerSessionID, &partnerID) == nil {
+							// Registrar o parceiro na MINHA sessão
 							_, _ = ep.db.Pool.Exec(ctx,
 								`INSERT INTO voice_participants (session_id, user_id, guild_id, channel_id, joined_at)
-								 VALUES ($1, $2, $3, $4, NOW())`,
+								 VALUES ($1, $2, $3, $4, NOW())
+								 ON CONFLICT DO NOTHING`,
 								sessionID, partnerID, guildID, channelID,
 							)
 
-							// atualizar estatisticas de parceiros (bidirecional)
+							// Registrar a MIM na sessão do parceiro
 							_, _ = ep.db.Pool.Exec(ctx,
-								`INSERT INTO voice_partner_stats (user_id, partner_id, guild_id, total_sessions, last_call_at)
-								 VALUES ($1, $2, $3, 1, NOW())
-								 ON CONFLICT (user_id, partner_id, guild_id) DO UPDATE SET 
-									total_sessions = voice_partner_stats.total_sessions + 1,
-									last_call_at = NOW()`,
-								userID, partnerID, guildID,
+								`INSERT INTO voice_participants (session_id, user_id, guild_id, channel_id, joined_at)
+								 VALUES ($1, $2, $3, $4, NOW())
+								 ON CONFLICT DO NOTHING`,
+								partnerSessionID, userID, guildID, channelID,
 							)
-							_, _ = ep.db.Pool.Exec(ctx,
-								`INSERT INTO voice_partner_stats (user_id, partner_id, guild_id, total_sessions, last_call_at)
-								 VALUES ($1, $2, $3, 1, NOW())
-								 ON CONFLICT (user_id, partner_id, guild_id) DO UPDATE SET 
-									total_sessions = voice_partner_stats.total_sessions + 1,
-									last_call_at = NOW()`,
-								partnerID, userID, guildID,
-							)
+
+							// Atualizar estatísticas de parceiros (bidirecional)
+							for _, tuple := range [][]string{{userID, partnerID}, {partnerID, userID}} {
+								_, _ = ep.db.Pool.Exec(ctx,
+									`INSERT INTO voice_partner_stats (user_id, partner_id, guild_id, total_sessions, last_call_at)
+									 VALUES ($1, $2, $3, 1, NOW())
+									 ON CONFLICT (user_id, partner_id, guild_id) DO UPDATE SET 
+										total_sessions = voice_partner_stats.total_sessions + 1,
+										last_call_at = NOW()`,
+									tuple[0], tuple[1], guildID,
+								)
+							}
 						}
 					}
 				}
@@ -852,22 +824,22 @@ func (ep *EventProcessor) HandleVoiceStateUpdate(ctx context.Context, event Even
 			}
 		}
 	} else if channelID == "" && guildID != "" {
-		// usuario saiu do canal de voz - finalizar sessao
+		// usuario saiu do canal de voz - finalizar todas as sessoes ativas deste usuario (segurança)
 		var sessionID int64
 		var oldChannelID string
 		_ = ep.db.Pool.QueryRow(ctx,
 			`SELECT id, channel_id FROM voice_sessions 
-			 WHERE user_id = $1 AND guild_id = $2 AND left_at IS NULL 
+			 WHERE user_id = $1 AND left_at IS NULL 
 			 ORDER BY joined_at DESC LIMIT 1`,
-			userID, guildID,
+			userID,
 		).Scan(&sessionID, &oldChannelID)
 
 		_, _ = ep.db.Pool.Exec(ctx,
 			`UPDATE voice_sessions 
 			 SET left_at = NOW(), 
 				 duration_seconds = EXTRACT(EPOCH FROM (NOW() - joined_at))::INTEGER
-			 WHERE user_id = $1 AND guild_id = $2 AND left_at IS NULL`,
-			userID, guildID,
+			 WHERE user_id = $1 AND left_at IS NULL`,
+			userID,
 		)
 
 		// marcar participantes como saiu
@@ -1245,5 +1217,41 @@ func (ep *EventProcessor) HandleGuildCreate(ctx context.Context, event Event) er
 		)
 	}
 
+	// Processar canais inclusos no payload de GUILD_CREATE
+	if channels, ok := event.Data["channels"].([]interface{}); ok {
+		for _, ch := range channels {
+			if chMap, ok := ch.(map[string]interface{}); ok {
+				_ = ep.HandleChannelCreateUpdate(ctx, Event{
+					Type: "CHANNEL_CREATE",
+					Data: chMap,
+				})
+			}
+		}
+	}
+
 	return nil
+}
+
+// HandleChannelCreateUpdate captura e atualiza informações de canais
+func (ep *EventProcessor) HandleChannelCreateUpdate(ctx context.Context, event Event) error {
+	channelID, _ := event.Data["id"].(string)
+	if channelID == "" {
+		return nil
+	}
+
+	guildID, _ := event.Data["guild_id"].(string)
+	name, _ := event.Data["name"].(string)
+	chType, _ := event.Data["type"].(float64)
+
+	_, err := ep.db.Pool.Exec(ctx,
+		`INSERT INTO channels (channel_id, guild_id, name, type, last_updated_at)
+		 VALUES ($1, $2, $3, $4, NOW())
+		 ON CONFLICT (channel_id) DO UPDATE SET 
+			name = EXCLUDED.name,
+			guild_id = COALESCE(EXCLUDED.guild_id, channels.guild_id),
+			type = COALESCE(EXCLUDED.type, channels.type),
+			last_updated_at = NOW()`,
+		channelID, guildID, name, int(chType),
+	)
+	return err
 }

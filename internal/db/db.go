@@ -21,7 +21,7 @@ func New(ctx context.Context, dsn string) (*DB, error) {
 	// prefer prepared statements safely via pgx automatic statement cache
 	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheStatement
 
-	cfg.MaxConns = 100
+	cfg.MaxConns = 50
 	cfg.MinConns = 5
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	cfg.MaxConnLifetime = 30 * time.Minute
