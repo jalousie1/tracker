@@ -55,7 +55,7 @@ export function Timeline({ events, avatars }: TimelineProps) {
                     >
                         <img src={avatar.url} alt="Avatar history" className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" />
                         <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                            <span className="text-[10px] text-white font-mono">{new Date(avatar.at).toISOString()}</span>
+                            <span className="text-[10px] text-white font-mono" suppressHydrationWarning>{new Date(avatar.at).toLocaleDateString()}</span>
                         </div>
                     </motion.div>
                 ))}
@@ -82,7 +82,7 @@ export function Timeline({ events, avatars }: TimelineProps) {
             <div className="flex flex-col gap-1">
                 <div className="flex items-center gap-2 text-xs text-neutral-500 font-mono mb-1">
                     <Clock className="w-3 h-3" />
-                    {new Date(event.at).toISOString()}
+                    <span suppressHydrationWarning>{new Date(event.at).toLocaleString()}</span>
                 </div>
                 <div className="glass p-4 rounded-xl border border-neutral-800/50 hover:border-neutral-700 transition-colors bg-neutral-900/30">
                     <div className="text-xs text-neutral-500 font-mono mb-1">{kindLabel(event.kind)}</div>

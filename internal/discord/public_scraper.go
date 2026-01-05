@@ -2,6 +2,7 @@ package discord
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -181,3 +182,222 @@ func (ps *PublicScraper) DownloadAvatar(ctx context.Context, userID, avatarHash 
 	return data, nil
 }
 
+// PublicUserData representa dados públicos de um usuário do Discord
+type PublicUserData struct {
+	ID          string   `json:"id"`
+	Username    string   `json:"username"`
+	GlobalName  string   `json:"global_name"`
+	Avatar      string   `json:"avatar"`
+	Banner      string   `json:"banner"`
+	AccentColor int      `json:"accent_color"`
+	Flags       int      `json:"public_flags"`
+	Bio         string   `json:"bio"`
+	Connections []string `json:"connections"`
+	Source      string   `json:"source"`
+	FetchedAt   time.Time
+}
+
+// FetchPublicData tenta buscar dados públicos do usuário de múltiplas fontes
+func (ps *PublicScraper) FetchPublicData(ctx context.Context, userID string) (*PublicUserData, error) {
+	// Tentar discord.id primeiro (API pública)
+	data, err := ps.fetchFromDiscordID(ctx, userID)
+	if err == nil && data != nil {
+		data.Source = "discord.id"
+		data.FetchedAt = time.Now()
+		return data, nil
+	}
+	ps.logger.Debug("discord_id_fetch_failed", "user_id", userID, "error", err)
+
+	// Tentar discordlookup.com
+	data, err = ps.fetchFromDiscordLookup(ctx, userID)
+	if err == nil && data != nil {
+		data.Source = "discordlookup.com"
+		data.FetchedAt = time.Now()
+		return data, nil
+	}
+	ps.logger.Debug("discordlookup_fetch_failed", "user_id", userID, "error", err)
+
+	return nil, fmt.Errorf("no_public_data_found")
+}
+
+// fetchFromDiscordID busca dados de discord.id (user info cache)
+func (ps *PublicScraper) fetchFromDiscordID(ctx context.Context, userID string) (*PublicUserData, error) {
+	url := fmt.Sprintf("https://discord.id/api/user/%s", userID)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := ps.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("discord_id_status=%d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse response
+	var result struct {
+		ID         string `json:"id"`
+		Username   string `json:"username"`
+		GlobalName string `json:"global_name"`
+		Avatar     string `json:"avatar"`
+		Banner     string `json:"banner"`
+		Flags      int    `json:"public_flags"`
+	}
+
+	if err := parseJSON(body, &result); err != nil {
+		return nil, err
+	}
+
+	if result.ID == "" {
+		return nil, fmt.Errorf("empty_response")
+	}
+
+	return &PublicUserData{
+		ID:         result.ID,
+		Username:   result.Username,
+		GlobalName: result.GlobalName,
+		Avatar:     result.Avatar,
+		Banner:     result.Banner,
+		Flags:      result.Flags,
+	}, nil
+}
+
+// fetchFromDiscordLookup busca dados de discordlookup.com
+func (ps *PublicScraper) fetchFromDiscordLookup(ctx context.Context, userID string) (*PublicUserData, error) {
+	url := fmt.Sprintf("https://discordlookup.com/api/user/%s", userID)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := ps.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("discordlookup_status=%d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse response
+	var result struct {
+		ID          string `json:"id"`
+		Username    string `json:"username"`
+		GlobalName  string `json:"global_name"`
+		Avatar      string `json:"avatar"`
+		Banner      string `json:"banner"`
+		AccentColor int    `json:"accent_color"`
+		Flags       int    `json:"public_flags"`
+	}
+
+	if err := parseJSON(body, &result); err != nil {
+		return nil, err
+	}
+
+	if result.ID == "" {
+		return nil, fmt.Errorf("empty_response")
+	}
+
+	return &PublicUserData{
+		ID:          result.ID,
+		Username:    result.Username,
+		GlobalName:  result.GlobalName,
+		Avatar:      result.Avatar,
+		Banner:      result.Banner,
+		AccentColor: result.AccentColor,
+		Flags:       result.Flags,
+	}, nil
+}
+
+// SavePublicData salva dados públicos no banco de dados
+func (ps *PublicScraper) SavePublicData(ctx context.Context, data *PublicUserData) error {
+	if data == nil || data.ID == "" {
+		return fmt.Errorf("invalid_data")
+	}
+
+	// Garantir que usuário existe
+	_, _ = ps.db.Pool.Exec(ctx,
+		`INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`,
+		data.ID,
+	)
+
+	// Salvar username se existir
+	if data.Username != "" {
+		var exists bool
+		_ = ps.db.Pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM username_history WHERE user_id = $1 AND username = $2 LIMIT 1)`,
+			data.ID, data.Username,
+		).Scan(&exists)
+
+		if !exists {
+			_, _ = ps.db.Pool.Exec(ctx,
+				`INSERT INTO username_history (user_id, username, global_name, changed_at)
+				 VALUES ($1, $2, $3, NOW())`,
+				data.ID, data.Username, data.GlobalName,
+			)
+			ps.logger.Info("public_username_saved", "user_id", data.ID, "username", data.Username, "source", data.Source)
+		}
+	}
+
+	// Salvar avatar se existir
+	if data.Avatar != "" {
+		var exists bool
+		_ = ps.db.Pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM avatar_history WHERE user_id = $1 AND hash_avatar = $2 LIMIT 1)`,
+			data.ID, data.Avatar,
+		).Scan(&exists)
+
+		if !exists {
+			_, _ = ps.db.Pool.Exec(ctx,
+				`INSERT INTO avatar_history (user_id, hash_avatar, changed_at)
+				 VALUES ($1, $2, NOW())`,
+				data.ID, data.Avatar,
+			)
+			ps.logger.Info("public_avatar_saved", "user_id", data.ID, "avatar", data.Avatar, "source", data.Source)
+		}
+	}
+
+	// Salvar banner se existir
+	if data.Banner != "" {
+		var exists bool
+		_ = ps.db.Pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM banner_history WHERE user_id = $1 AND banner_hash = $2 LIMIT 1)`,
+			data.ID, data.Banner,
+		).Scan(&exists)
+
+		if !exists {
+			_, _ = ps.db.Pool.Exec(ctx,
+				`INSERT INTO banner_history (user_id, banner_hash, changed_at)
+				 VALUES ($1, $2, NOW())`,
+				data.ID, data.Banner,
+			)
+			ps.logger.Info("public_banner_saved", "user_id", data.ID, "banner", data.Banner, "source", data.Source)
+		}
+	}
+
+	return nil
+}
+
+// parseJSON helper para parsear JSON
+func parseJSON(data []byte, v interface{}) error {
+	return json.Unmarshal(data, v)
+}

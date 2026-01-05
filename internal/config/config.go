@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 )
@@ -16,6 +17,16 @@ type Config struct {
 	R2Bucket   string
 	RedisDSN   string
 
+	// Event processing
+	EventWorkerCount int
+
+	// Discord scraping/runtime behavior
+	DiscordEnableGuildSubscriptions  bool
+	DiscordRequestMemberPresences    bool
+	DiscordScrapeInitialGuildMembers bool
+	DiscordMaxConcurrentGuildScrapes int
+	DiscordScrapeQueryDelayMs        int
+
 	// raw secrets kept in-memory only; never log these
 	R2KeysRaw         string
 	EncryptionKeysRaw string
@@ -27,15 +38,21 @@ type Config struct {
 
 func Load() (Config, error) {
 	cfg := Config{
-		DBDSN:          os.Getenv("DB_DSN"),
-		HTTPAddr:       getenvDefault("HTTP_ADDR", ":8080"),
-		LogLevel:       getenvDefault("LOG_LEVEL", "info"),
-		R2Endpoint:     getenvDefault("R2_ENDPOINT", ""),
-		R2Bucket:       getenvDefault("R2_BUCKET", ""),
-		R2KeysRaw:      os.Getenv("R2_KEYS"),
-		RedisDSN:       getenvDefault("REDIS_DSN", "redis://localhost:6379/0"),
-		AdminSecretKey: getenvDefault("ADMIN_SECRET_KEY", ""),
-		BotToken:       os.Getenv("BOT_TOKEN"),
+		DBDSN:                            os.Getenv("DB_DSN"),
+		HTTPAddr:                         getenvDefault("HTTP_ADDR", ":8080"),
+		LogLevel:                         getenvDefault("LOG_LEVEL", "info"),
+		R2Endpoint:                       getenvDefault("R2_ENDPOINT", ""),
+		R2Bucket:                         getenvDefault("R2_BUCKET", ""),
+		R2KeysRaw:                        os.Getenv("R2_KEYS"),
+		RedisDSN:                         getenvDefault("REDIS_DSN", "redis://localhost:6379/0"),
+		EventWorkerCount:                 getenvIntDefault("EVENT_WORKER_COUNT", 20),
+		AdminSecretKey:                   getenvDefault("ADMIN_SECRET_KEY", ""),
+		BotToken:                         os.Getenv("BOT_TOKEN"),
+		DiscordEnableGuildSubscriptions:  getenvBoolDefault("DISCORD_ENABLE_GUILD_SUBSCRIPTIONS", true),
+		DiscordRequestMemberPresences:    getenvBoolDefault("DISCORD_REQUEST_MEMBER_PRESENCES", true),
+		DiscordScrapeInitialGuildMembers: getenvBoolDefault("DISCORD_SCRAPE_INITIAL_GUILD_MEMBERS", true),
+		DiscordMaxConcurrentGuildScrapes: getenvIntDefault("DISCORD_MAX_CONCURRENT_GUILD_SCRAPES", 1),
+		DiscordScrapeQueryDelayMs:        getenvIntDefault("DISCORD_SCRAPE_QUERY_DELAY_MS", 250),
 	}
 
 	cfg.EncryptionKeysRaw = os.Getenv("ENCRYPTION_KEY")
@@ -86,5 +103,31 @@ func getenvDefault(k, def string) string {
 	return v
 }
 
+func getenvBoolDefault(k string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return def
+	}
+}
 
-
+func getenvIntDefault(k string, def int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	// accept plain ints; on parse failure, fall back
+	var n int
+	_, err := fmt.Sscanf(v, "%d", &n)
+	if err != nil {
+		return def
+	}
+	return n
+}

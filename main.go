@@ -13,6 +13,7 @@ import (
 	"identity-archive/internal/config"
 	"identity-archive/internal/db"
 	"identity-archive/internal/discord"
+	"identity-archive/internal/external"
 	"identity-archive/internal/logging"
 	"identity-archive/internal/processor"
 	"identity-archive/internal/redis"
@@ -25,8 +26,11 @@ func main() {
 		panic(err)
 	}
 
+	// Imprimir banner bonito
+	logging.PrintBanner()
+
 	logger := logging.New(cfg.LogLevel)
-	logger.Info("starting", "service", "identity-archive", "http_addr", cfg.HTTPAddr)
+	logger.Info("starting_service", "service", "identity-archive", "http_addr", cfg.HTTPAddr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -51,7 +55,7 @@ func main() {
 	eventProcessor := processor.NewEventProcessor(logger, dbConn, redisClient, storageClient)
 
 	// iniciar workers para processar eventos
-	eventProcessor.StartWorkers(5)
+	eventProcessor.StartWorkers(cfg.EventWorkerCount)
 
 	// inicializar token manager (gerencia tokens criptografados)
 	var tokenManager *discord.TokenManager
@@ -69,18 +73,42 @@ func main() {
 			userFetcher = discord.NewUserFetcher(logger, dbConn, redisClient, tokenManager, cfg.BotToken)
 			logger.Info("user_fetcher_initialized", "can_fetch_users", tokenManager.GetActiveTokenCount() > 0, "has_bot_token", cfg.BotToken != "")
 
+			// inicializar sources (multi-plataforma)
+			// PRIORIDADE:
+			// 1. Discord API via User Token (prioridade 0 - dados completos: bio, banner, etc)
+			// 2. Sites públicos: discord.id, discordlookup.com, lantern.rest, japi.rest
+			// 3. Discord CDN (apenas verifica existência)
+			sourceManager := external.NewSourceManager(logger)
+
+			// Fonte primária: User Tokens do Discord (dados mais completos)
+			sourceManager.RegisterSource(discord.NewDiscordLookupSource(logger, userFetcher))
+
+			// Fontes públicas externas (scraping de sites)
+			for _, publicSource := range external.CreateAllPublicSources(logger) {
+				sourceManager.RegisterSource(publicSource)
+			}
+
+			logger.Info("source_manager_initialized", "total_sources", len(external.CreateAllPublicSources(logger))+1)
+
 			// inicializar public scraper para coletar dados publicos
 			publicScraper = discord.NewPublicScraper(logger, dbConn, redisClient, tokenManager, cfg.BotToken)
 			logger.Info("public_scraper_initialized")
 
 			// inicializar scraper para coletar dados de guilds
-			scraper := discord.NewScraper(logger, dbConn, redisClient)
+			scraper := discord.NewScraperWithOptions(logger, dbConn, redisClient, discord.ScraperOptions{
+				QueryDelay: time.Duration(cfg.DiscordScrapeQueryDelayMs) * time.Millisecond,
+			})
 
 			// inicializar gateway manager para conectar ao discord
-			gatewayManager = discord.NewGatewayManager(tokenManager, eventProcessor, scraper, logger, dbConn)
+			gatewayManager = discord.NewGatewayManagerWithOptions(tokenManager, eventProcessor, scraper, logger, dbConn, discord.GatewayManagerOptions{
+				EnableGuildSubscriptions:  cfg.DiscordEnableGuildSubscriptions,
+				RequestMemberPresences:    cfg.DiscordRequestMemberPresences,
+				ScrapeInitialGuildMembers: cfg.DiscordScrapeInitialGuildMembers,
+				MaxConcurrentGuildScrapes: cfg.DiscordMaxConcurrentGuildScrapes,
+			})
 
-			// inicializar job de coleta publica
-			publicCollectorJob = discord.NewPublicCollectorJob(logger, dbConn, redisClient, userFetcher, publicScraper)
+			// inicializar job de coleta publica (com TokenManager para processamento paralelo)
+			publicCollectorJob = discord.NewPublicCollectorJob(logger, dbConn, redisClient, sourceManager, userFetcher, tokenManager, publicScraper)
 			go publicCollectorJob.Start()
 			logger.Info("public_collector_job_started")
 
@@ -119,7 +147,14 @@ func main() {
 		}
 	}()
 
-	logger.Info("api_started", "addr", cfg.HTTPAddr)
+	// Imprimir informações de startup bonitas
+	tokensCount := 0
+	if tokenManager != nil {
+		tokensCount = tokenManager.GetActiveTokenCount()
+	}
+	logging.PrintStartupInfo(cfg.HTTPAddr, true, tokensCount)
+
+	logger.Info("api_server_ready", "addr", cfg.HTTPAddr)
 
 	// graceful shutdown
 	stop := make(chan os.Signal, 2)

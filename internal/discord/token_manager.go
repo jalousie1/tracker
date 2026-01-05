@@ -61,6 +61,14 @@ func NewTokenManager(logger *slog.Logger, dbConn *db.DB, redisClient *redis.Clie
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Best-effort: remove duplicate tokens from DB before loading into memory.
+	// This prevents duplicates from showing in admin panel and avoids wasting gateway connections.
+	if removed, err := DeduplicateTokensInDB(ctx, logger, dbConn, encryptionKey); err != nil {
+		logger.Warn("token_dedup_failed", "error", err)
+	} else if removed > 0 {
+		logger.Info("token_dedup_removed", "removed", removed)
+	}
+
 	if err := tm.loadActiveTokens(ctx); err != nil {
 		return nil, fmt.Errorf("failed to load tokens: %w", err)
 	}
@@ -171,6 +179,24 @@ func (tm *TokenManager) validateTokenHealth(ctx context.Context, token string) b
 	}
 
 	return resp.StatusCode == http.StatusOK
+}
+
+// GetAllActiveTokens retorna copia de todos os tokens ativos para processamento paralelo
+func (tm *TokenManager) GetAllActiveTokens() []*TokenEntry {
+	tm.mutex.RLock()
+	defer tm.mutex.RUnlock()
+
+	tokens := make([]*TokenEntry, 0, len(tm.activeTokens))
+	now := time.Now()
+	for i := range tm.activeTokens {
+		entry := &tm.activeTokens[i]
+		// pular tokens suspensos
+		if entry.SuspendedUntil != nil && now.Before(*entry.SuspendedUntil) {
+			continue
+		}
+		tokens = append(tokens, entry)
+	}
+	return tokens
 }
 
 func (tm *TokenManager) GetNextAvailableToken() (*TokenEntry, error) {
@@ -319,6 +345,16 @@ func (tm *TokenManager) getMaskedToken(tokenID int64) string {
 }
 
 func (tm *TokenManager) AddToken(tokenString string, ownerUserID string) error {
+	// Fast in-memory dedupe (prevents accidental double-submit)
+	tm.mutex.RLock()
+	for _, entry := range tm.activeTokens {
+		if entry.DecryptedValue == tokenString {
+			tm.mutex.RUnlock()
+			return errors.New("token_already_exists")
+		}
+	}
+	tm.mutex.RUnlock()
+
 	// Validate format
 	if !tm.validateTokenFormat(tokenString) {
 		return errors.New("invalid_token_format")
@@ -338,18 +374,48 @@ func (tm *TokenManager) AddToken(tokenString string, ownerUserID string) error {
 		return fmt.Errorf("failed to encrypt token: %w", err)
 	}
 
+	fingerprint := tokenFingerprint(tokenString)
+
+	// If token_fingerprint column exists, prevent duplicates across ALL statuses.
+	if hasCol, _ := tokensHasColumn(ctx, tm.db, "token_fingerprint"); hasCol {
+		var existingID int64
+		err := tm.db.Pool.QueryRow(ctx,
+			`SELECT id FROM tokens WHERE token_fingerprint = $1 LIMIT 1`,
+			fingerprint,
+		).Scan(&existingID)
+		if err == nil && existingID > 0 {
+			return errors.New("token_already_exists")
+		}
+	}
+
 	// Insert into database
 	var tokenID int64
-	err = tm.db.Pool.QueryRow(ctx,
-		`INSERT INTO tokens (token, token_encrypted, user_id, status, created_at)
-		 VALUES ($1, $2, $3, $4, NOW())
-		 RETURNING id`,
-		encrypted,
-		encrypted,
-		ownerUserID,
-		string(TokenActive),
-	).Scan(&tokenID)
+	if hasCol, _ := tokensHasColumn(ctx, tm.db, "token_fingerprint"); hasCol {
+		err = tm.db.Pool.QueryRow(ctx,
+			`INSERT INTO tokens (token, token_encrypted, token_fingerprint, user_id, status, created_at)
+			 VALUES ($1, $2, $3, $4, $5, NOW())
+			 RETURNING id`,
+			encrypted,
+			encrypted,
+			fingerprint,
+			ownerUserID,
+			string(TokenActive),
+		).Scan(&tokenID)
+	} else {
+		err = tm.db.Pool.QueryRow(ctx,
+			`INSERT INTO tokens (token, token_encrypted, user_id, status, created_at)
+			 VALUES ($1, $2, $3, $4, NOW())
+			 RETURNING id`,
+			encrypted,
+			encrypted,
+			ownerUserID,
+			string(TokenActive),
+		).Scan(&tokenID)
+	}
 	if err != nil {
+		if regexp.MustCompile(`(?i)duplicate key|ux_tokens_token_fingerprint`).MatchString(err.Error()) {
+			return errors.New("token_already_exists")
+		}
 		return fmt.Errorf("failed to insert token: %w", err)
 	}
 
@@ -371,6 +437,119 @@ func (tm *TokenManager) AddToken(tokenString string, ownerUserID string) error {
 	tm.logger.Info("token_added", "token_id", tokenID, "token", masked, "user_id", ownerUserID)
 
 	return nil
+}
+
+func tokenFingerprint(tokenString string) string {
+	// kept for backward compatibility inside this file
+	return TokenFingerprintForAPI(tokenString)
+}
+
+func tokensHasColumn(ctx context.Context, dbConn *db.DB, columnName string) (bool, error) {
+	var exists bool
+	err := dbConn.Pool.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_name = 'tokens' AND column_name = $1
+		)`,
+		columnName,
+	).Scan(&exists)
+	return exists, err
+}
+
+// DeduplicateTokensInDB removes duplicate plaintext tokens (even if ciphertext differs).
+// It keeps the newest row (highest id), repoints token_id references, deletes the older duplicates,
+// and (when available) backfills token_fingerprint for the kept rows.
+func DeduplicateTokensInDB(ctx context.Context, logger *slog.Logger, dbConn *db.DB, encryptionKey []byte) (int, error) {
+	if len(encryptionKey) != 32 {
+		return 0, errors.New("encryption key must be 32 bytes")
+	}
+
+	hasFingerprintCol, err := tokensHasColumn(ctx, dbConn, "token_fingerprint")
+	if err != nil {
+		return 0, err
+	}
+
+	rows, err := dbConn.Pool.Query(ctx, `SELECT id, token_encrypted FROM tokens ORDER BY id DESC`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	ws := regexp.MustCompile(`\s+`)
+
+	type rowInfo struct {
+		id          int64
+		fingerprint string
+	}
+
+	keepByFingerprint := make(map[string]int64)
+	dups := make([]struct{ dupID, keepID int64 }, 0)
+	kept := make([]rowInfo, 0)
+
+	for rows.Next() {
+		var id int64
+		var enc string
+		if err := rows.Scan(&id, &enc); err != nil {
+			continue
+		}
+
+		plain, err := security.DecryptToken(enc, encryptionKey)
+		if err != nil {
+			// can't compare; skip
+			continue
+		}
+		plain = ws.ReplaceAllString(plain, "")
+		fp := tokenFingerprint(plain)
+
+		if keepID, ok := keepByFingerprint[fp]; ok {
+			dups = append(dups, struct{ dupID, keepID int64 }{dupID: id, keepID: keepID})
+			continue
+		}
+		keepByFingerprint[fp] = id
+		kept = append(kept, rowInfo{id: id, fingerprint: fp})
+	}
+
+	if len(dups) == 0 && !hasFingerprintCol {
+		return 0, nil
+	}
+
+	tx, err := dbConn.Pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Backfill fingerprint for kept rows when column exists.
+	if hasFingerprintCol {
+		for _, k := range kept {
+			_, _ = tx.Exec(ctx,
+				`UPDATE tokens SET token_fingerprint = $1 WHERE id = $2 AND (token_fingerprint IS NULL OR token_fingerprint = '')`,
+				k.fingerprint, k.id,
+			)
+		}
+	}
+
+	removed := 0
+	for _, d := range dups {
+		// repoint token_id references to the kept row
+		_, _ = tx.Exec(ctx, `UPDATE guild_members SET token_id = $1 WHERE token_id = $2`, d.keepID, d.dupID)
+		_, _ = tx.Exec(ctx, `UPDATE token_guilds SET token_id = $1 WHERE token_id = $2`, d.keepID, d.dupID)
+		_, _ = tx.Exec(ctx, `UPDATE token_failures SET token_id = $1 WHERE token_id = $2`, d.keepID, d.dupID)
+
+		// delete duplicate token row so it won't show in admin panel
+		if _, err := tx.Exec(ctx, `DELETE FROM tokens WHERE id = $1`, d.dupID); err == nil {
+			removed++
+		} else {
+			logger.Warn("token_dedup_delete_failed", "dup_id", d.dupID, "keep_id", d.keepID, "error", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+
+	return removed, nil
 }
 
 func (tm *TokenManager) StartReactivationJob() {
@@ -513,7 +692,7 @@ func (tm *TokenManager) RemoveToken(ctx context.Context, tokenID int64) error {
 	// Remove from active pool
 	tm.mutex.Lock()
 	defer tm.mutex.Unlock()
-	
+
 	for i, entry := range tm.activeTokens {
 		if entry.ID == tokenID {
 			tm.activeTokens = append(tm.activeTokens[:i], tm.activeTokens[i+1:]...)
@@ -545,4 +724,3 @@ func (tm *TokenManager) GetTokenByID(tokenID int64) (*TokenEntry, error) {
 
 	return nil, errors.New("token_not_found_or_inactive")
 }
-

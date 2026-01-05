@@ -14,19 +14,33 @@ import (
 )
 
 type Scraper struct {
-	db     *db.DB
-	redis  *redis.Client
-	logger *slog.Logger
+	db         *db.DB
+	redis      *redis.Client
+	logger     *slog.Logger
+	queryDelay time.Duration
 	// cache de membros ja processados por guild (para evitar duplicatas no scraping alfabetico)
 	processedMembers map[string]map[string]bool // guild_id -> user_id -> true
 	membersMutex     sync.RWMutex
 }
 
+type ScraperOptions struct {
+	QueryDelay time.Duration
+}
+
 func NewScraper(logger *slog.Logger, dbConn *db.DB, redisClient *redis.Client) *Scraper {
+	return NewScraperWithOptions(logger, dbConn, redisClient, ScraperOptions{QueryDelay: 250 * time.Millisecond})
+}
+
+func NewScraperWithOptions(logger *slog.Logger, dbConn *db.DB, redisClient *redis.Client, opts ScraperOptions) *Scraper {
+	qd := opts.QueryDelay
+	if qd <= 0 {
+		qd = 250 * time.Millisecond
+	}
 	return &Scraper{
 		db:               dbConn,
 		redis:            redisClient,
 		logger:           logger,
+		queryDelay:       qd,
 		processedMembers: make(map[string]map[string]bool),
 	}
 }
@@ -114,7 +128,7 @@ func (s *Scraper) ScrapeGuildMembers(ctx context.Context, guildID string, conn *
 		)
 
 		// Delay entre requests para evitar rate limit
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(s.queryDelay)
 	}
 
 	s.logger.Info("alphabetic_scrape_completed",

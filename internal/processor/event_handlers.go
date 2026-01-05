@@ -3,6 +3,7 @@ package processor
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 func (ep *EventProcessor) HandleUserUpdate(ctx context.Context, event Event) error {
@@ -214,6 +215,12 @@ func (ep *EventProcessor) HandlePresenceUpdate(ctx context.Context, event Event)
 	// garantir que usuario existe
 	_, _ = ep.db.Pool.Exec(ctx,
 		`INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`,
+		userID,
+	)
+
+	// mark user as freshly observed
+	_, _ = ep.db.Pool.Exec(ctx,
+		`UPDATE users SET last_updated_at = NOW() WHERE id = $1`,
 		userID,
 	)
 
@@ -429,6 +436,26 @@ func (ep *EventProcessor) HandleGuildMembersChunk(ctx context.Context, event Eve
 		}
 	}
 
+	// Some Discord chunk payloads include presence snapshots under `presences`.
+	// When available, process them as if they were PRESENCE_UPDATE to populate presence/activity history.
+	if presencesRaw, ok := event.Data["presences"].([]interface{}); ok && len(presencesRaw) > 0 {
+		for _, pr := range presencesRaw {
+			presenceMap, ok := pr.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, hasGuild := presenceMap["guild_id"]; !hasGuild {
+				presenceMap["guild_id"] = guildID
+			}
+			_ = ep.HandlePresenceUpdate(ctx, Event{
+				Type:      "PRESENCE_UPDATE",
+				Data:      presenceMap,
+				Timestamp: event.Timestamp,
+				TokenID:   event.TokenID,
+			})
+		}
+	}
+
 	return nil
 }
 
@@ -573,6 +600,7 @@ func (ep *EventProcessor) HandleMessageCreate(ctx context.Context, event Event) 
 	messageID, _ := event.Data["id"].(string)
 	content, _ := event.Data["content"].(string)
 	timestamp, _ := event.Data["timestamp"].(string)
+	editedTimestamp, _ := event.Data["edited_timestamp"].(string)
 
 	// extrair dados do autor
 	var username, discriminator, globalName, avatarHash *string
@@ -607,18 +635,40 @@ func (ep *EventProcessor) HandleMessageCreate(ctx context.Context, event Event) 
 
 	// salvar estatisticas de mensagens
 	if guildID != "" && channelID != "" {
-		_, _ = ep.db.Pool.Exec(ctx,
+		if _, err := ep.db.Pool.Exec(ctx,
 			`INSERT INTO message_stats (user_id, guild_id, channel_id, message_count, first_message_at, last_message_at)
 			 VALUES ($1, $2, $3, 1, NOW(), NOW())
 			 ON CONFLICT (user_id, guild_id, channel_id) DO UPDATE SET 
 				message_count = message_stats.message_count + 1,
 				last_message_at = NOW()`,
 			userID, guildID, channelID,
-		)
+		); err != nil {
+			ep.log.Warn("message_stats_insert_failed", "user_id", userID, "guild_id", guildID, "channel_id", channelID, "error", err)
+		}
 	}
 
 	// salvar mensagem completa se tiver ID
 	if messageID != "" && channelID != "" {
+		createdAt := time.Now().UTC()
+		if timestamp != "" {
+			if t, err := time.Parse(time.RFC3339Nano, timestamp); err == nil {
+				createdAt = t
+			} else if t, err := time.Parse(time.RFC3339, timestamp); err == nil {
+				createdAt = t
+			} else {
+				ep.log.Warn("message_timestamp_parse_failed", "user_id", userID, "message_id", messageID, "timestamp", timestamp, "error", err)
+			}
+		}
+
+		var editedAt *time.Time
+		if editedTimestamp != "" {
+			if t, err := time.Parse(time.RFC3339Nano, editedTimestamp); err == nil {
+				editedAt = &t
+			} else if t, err := time.Parse(time.RFC3339, editedTimestamp); err == nil {
+				editedAt = &t
+			}
+		}
+
 		hasAttachments := false
 		hasEmbeds := false
 		var replyToMsgID, replyToUserID *string
@@ -644,12 +694,14 @@ func (ep *EventProcessor) HandleMessageCreate(ctx context.Context, event Event) 
 			}
 		}
 
-		_, _ = ep.db.Pool.Exec(ctx,
-			`INSERT INTO messages (message_id, user_id, guild_id, channel_id, content, created_at, has_attachments, has_embeds, reply_to_message_id, reply_to_user_id)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		if _, err := ep.db.Pool.Exec(ctx,
+			`INSERT INTO messages (message_id, user_id, guild_id, channel_id, content, created_at, edited_at, has_attachments, has_embeds, reply_to_message_id, reply_to_user_id)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			 ON CONFLICT (message_id) DO NOTHING`,
-			messageID, userID, guildID, channelID, content, timestamp, hasAttachments, hasEmbeds, replyToMsgID, replyToUserID,
-		)
+			messageID, userID, guildID, channelID, content, createdAt, editedAt, hasAttachments, hasEmbeds, replyToMsgID, replyToUserID,
+		); err != nil {
+			ep.log.Warn("message_insert_failed", "user_id", userID, "message_id", messageID, "guild_id", guildID, "channel_id", channelID, "error", err)
+		}
 	}
 
 	// salvar username se tiver
@@ -717,65 +769,88 @@ func (ep *EventProcessor) HandleVoiceStateUpdate(ctx context.Context, event Even
 	selfVideo, _ := event.Data["self_video"].(bool)
 
 	if channelID != "" && guildID != "" {
-		// usuario entrou em um canal de voz - criar sessao
-		var sessionID int64
+		// Verificar se já existe sessão ativa para este usuário neste canal
+		var existingSessionID int64
 		err := ep.db.Pool.QueryRow(ctx,
-			`INSERT INTO voice_sessions (user_id, guild_id, channel_id, joined_at, was_muted, was_deafened, was_streaming, was_video)
-			 VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7)
-			 RETURNING id`,
-			userID, guildID, channelID, selfMute, selfDeaf, selfStream, selfVideo,
-		).Scan(&sessionID)
+			`SELECT id FROM voice_sessions 
+			 WHERE user_id = $1 AND guild_id = $2 AND channel_id = $3 AND left_at IS NULL 
+			 LIMIT 1`,
+			userID, guildID, channelID,
+		).Scan(&existingSessionID)
 
-		if err == nil && sessionID > 0 {
-			// buscar outros usuarios no mesmo canal e registrar como participantes
-			rows, _ := ep.db.Pool.Query(ctx,
-				`SELECT DISTINCT user_id FROM voice_sessions 
-				 WHERE guild_id = $1 AND channel_id = $2 AND left_at IS NULL AND user_id != $3`,
-				guildID, channelID, userID,
+		if err == nil && existingSessionID > 0 {
+			// Sessão já existe - apenas atualizar flags (mute/deaf/video/stream podem mudar durante a call)
+			_, _ = ep.db.Pool.Exec(ctx,
+				`UPDATE voice_sessions SET 
+					was_muted = was_muted OR $2,
+					was_deafened = was_deafened OR $3,
+					was_streaming = was_streaming OR $4,
+					was_video = was_video OR $5
+				 WHERE id = $1`,
+				existingSessionID, selfMute, selfDeaf, selfStream, selfVideo,
 			)
-			if rows != nil {
-				defer rows.Close()
-				for rows.Next() {
-					var partnerID string
-					if rows.Scan(&partnerID) == nil && partnerID != "" {
-						// registrar participante na sessao
-						_, _ = ep.db.Pool.Exec(ctx,
-							`INSERT INTO voice_participants (session_id, user_id, guild_id, channel_id, joined_at)
-							 VALUES ($1, $2, $3, $4, NOW())`,
-							sessionID, partnerID, guildID, channelID,
-						)
+			// Não criar nova sessão, apenas retornar após processar member data
+		} else {
+			// Não existe sessão ativa - criar nova sessão (usuário acabou de entrar)
+			var sessionID int64
+			err := ep.db.Pool.QueryRow(ctx,
+				`INSERT INTO voice_sessions (user_id, guild_id, channel_id, joined_at, was_muted, was_deafened, was_streaming, was_video)
+				 VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7)
+				 RETURNING id`,
+				userID, guildID, channelID, selfMute, selfDeaf, selfStream, selfVideo,
+			).Scan(&sessionID)
 
-						// atualizar estatisticas de parceiros (bidirecional)
-						_, _ = ep.db.Pool.Exec(ctx,
-							`INSERT INTO voice_partner_stats (user_id, partner_id, guild_id, total_sessions, last_call_at)
-							 VALUES ($1, $2, $3, 1, NOW())
-							 ON CONFLICT (user_id, partner_id, guild_id) DO UPDATE SET 
-								total_sessions = voice_partner_stats.total_sessions + 1,
-								last_call_at = NOW()`,
-							userID, partnerID, guildID,
-						)
-						_, _ = ep.db.Pool.Exec(ctx,
-							`INSERT INTO voice_partner_stats (user_id, partner_id, guild_id, total_sessions, last_call_at)
-							 VALUES ($1, $2, $3, 1, NOW())
-							 ON CONFLICT (user_id, partner_id, guild_id) DO UPDATE SET 
-								total_sessions = voice_partner_stats.total_sessions + 1,
-								last_call_at = NOW()`,
-							partnerID, userID, guildID,
-						)
+			if err == nil && sessionID > 0 {
+				// buscar outros usuarios no mesmo canal e registrar como participantes
+				rows, _ := ep.db.Pool.Query(ctx,
+					`SELECT DISTINCT user_id FROM voice_sessions 
+					 WHERE guild_id = $1 AND channel_id = $2 AND left_at IS NULL AND user_id != $3`,
+					guildID, channelID, userID,
+				)
+				if rows != nil {
+					defer rows.Close()
+					for rows.Next() {
+						var partnerID string
+						if rows.Scan(&partnerID) == nil && partnerID != "" {
+							// registrar participante na sessao
+							_, _ = ep.db.Pool.Exec(ctx,
+								`INSERT INTO voice_participants (session_id, user_id, guild_id, channel_id, joined_at)
+								 VALUES ($1, $2, $3, $4, NOW())`,
+								sessionID, partnerID, guildID, channelID,
+							)
+
+							// atualizar estatisticas de parceiros (bidirecional)
+							_, _ = ep.db.Pool.Exec(ctx,
+								`INSERT INTO voice_partner_stats (user_id, partner_id, guild_id, total_sessions, last_call_at)
+								 VALUES ($1, $2, $3, 1, NOW())
+								 ON CONFLICT (user_id, partner_id, guild_id) DO UPDATE SET 
+									total_sessions = voice_partner_stats.total_sessions + 1,
+									last_call_at = NOW()`,
+								userID, partnerID, guildID,
+							)
+							_, _ = ep.db.Pool.Exec(ctx,
+								`INSERT INTO voice_partner_stats (user_id, partner_id, guild_id, total_sessions, last_call_at)
+								 VALUES ($1, $2, $3, 1, NOW())
+								 ON CONFLICT (user_id, partner_id, guild_id) DO UPDATE SET 
+									total_sessions = voice_partner_stats.total_sessions + 1,
+									last_call_at = NOW()`,
+								partnerID, userID, guildID,
+							)
+						}
 					}
 				}
+
+				// atualizar estatisticas apenas quando cria nova sessão
+				_, _ = ep.db.Pool.Exec(ctx,
+					`INSERT INTO voice_stats (user_id, guild_id, total_sessions, last_session_at)
+					 VALUES ($1, $2, 1, NOW())
+					 ON CONFLICT (user_id, guild_id) DO UPDATE SET 
+						total_sessions = voice_stats.total_sessions + 1,
+						last_session_at = NOW()`,
+					userID, guildID,
+				)
 			}
 		}
-
-		// atualizar estatisticas
-		_, _ = ep.db.Pool.Exec(ctx,
-			`INSERT INTO voice_stats (user_id, guild_id, total_sessions, last_session_at)
-			 VALUES ($1, $2, 1, NOW())
-			 ON CONFLICT (user_id, guild_id) DO UPDATE SET 
-				total_sessions = voice_stats.total_sessions + 1,
-				last_session_at = NOW()`,
-			userID, guildID,
-		)
 	} else if channelID == "" && guildID != "" {
 		// usuario saiu do canal de voz - finalizar sessao
 		var sessionID int64
@@ -1128,4 +1203,47 @@ func (ep *EventProcessor) processUserExtras(ctx context.Context, userData map[st
 			userID, accentColor, premiumType, publicFlags, flags, bot, system, mfaEnabled, verified, locale, email,
 		)
 	}
+}
+
+// HandleGuildCreate processa eventos GUILD_CREATE para salvar member_count e dados do guild
+func (ep *EventProcessor) HandleGuildCreate(ctx context.Context, event Event) error {
+	guildID, _ := event.Data["id"].(string)
+	if guildID == "" {
+		return fmt.Errorf("missing guild_id in GUILD_CREATE")
+	}
+
+	// Extrair dados do guild
+	name, _ := event.Data["name"].(string)
+	icon, _ := event.Data["icon"].(string)
+
+	// member_count é enviado como float64 pelo JSON
+	var memberCount int
+	if mc, ok := event.Data["member_count"].(float64); ok {
+		memberCount = int(mc)
+	}
+
+	// Salvar/atualizar guild com member_count
+	_, err := ep.db.Pool.Exec(ctx,
+		`INSERT INTO guilds (guild_id, name, icon, member_count, discovered_at)
+		 VALUES ($1, $2, $3, $4, NOW())
+		 ON CONFLICT (guild_id) DO UPDATE SET 
+			name = COALESCE(NULLIF($2, ''), guilds.name),
+			icon = COALESCE($3, guilds.icon),
+			member_count = CASE WHEN $4 > 0 THEN $4 ELSE guilds.member_count END`,
+		guildID, name, icon, memberCount,
+	)
+	if err != nil {
+		ep.log.Warn("failed_to_save_guild", "guild_id", guildID, "error", err)
+		return err
+	}
+
+	if memberCount > 0 {
+		ep.log.Info("guild_create_with_member_count",
+			"guild_id", guildID,
+			"name", name,
+			"member_count", memberCount,
+		)
+	}
+
+	return nil
 }

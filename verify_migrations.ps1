@@ -39,7 +39,13 @@ $tables = @(
     "nickname_history",
     "clan_history",
     "message_stats",
-    "avatar_decoration_history"
+    "avatar_decoration_history",
+    "messages",
+    "voice_partner_stats",
+    "channels",
+    "relationships",
+    "roles",
+    "emojis"
 )
 
 Write-Host "Verificando tabelas..." -ForegroundColor Yellow
@@ -57,6 +63,28 @@ foreach ($table in $tables) {
     } else {
         $missing += $table
         Write-Host "  [FALTA] $table" -ForegroundColor Red
+    }
+}
+
+Write-Host ""
+
+# verificar colunas da tabela guilds
+Write-Host "Verificando colunas da tabela guilds..." -ForegroundColor Yellow
+
+$guildColumns = @(
+    "guild_id", "name", "member_count", "discovered_at", "icon"
+)
+
+$missingGuildCols = @()
+foreach ($col in $guildColumns) {
+    $result = docker exec $containerName psql -U postgres -d tracker -t -c "SELECT EXISTS (SELECT FROM information_schema.columns WHERE table_name = 'guilds' AND column_name = '$col');" 2>$null
+    $exists = $result.Trim() -eq "t"
+
+    if ($exists) {
+        Write-Host "  [OK] guilds.$col" -ForegroundColor Green
+    } else {
+        $missingGuildCols += $col
+        Write-Host "  [FALTA] guilds.$col" -ForegroundColor Red
     }
 }
 
@@ -88,6 +116,29 @@ foreach ($col in $userColumns) {
 
 Write-Host ""
 
+# verificar colunas da tabela tokens
+Write-Host "Verificando colunas da tabela tokens..." -ForegroundColor Yellow
+
+$tokenColumns = @(
+    "id", "token", "token_encrypted", "token_fingerprint", "user_id", "status", "created_at",
+    "failure_count", "suspended_until", "banned_at", "last_used"
+)
+
+$missingTokenCols = @()
+foreach ($col in $tokenColumns) {
+    $result = docker exec $containerName psql -U postgres -d tracker -t -c "SELECT EXISTS (SELECT FROM information_schema.columns WHERE table_name = 'tokens' AND column_name = '$col');" 2>$null
+    $exists = $result.Trim() -eq "t"
+
+    if ($exists) {
+        Write-Host "  [OK] tokens.$col" -ForegroundColor Green
+    } else {
+        $missingTokenCols += $col
+        Write-Host "  [FALTA] tokens.$col" -ForegroundColor Red
+    }
+}
+
+Write-Host ""
+
 # resumo
 Write-Host "=== Resumo ===" -ForegroundColor Cyan
 Write-Host "Tabelas encontradas: $($found.Count)/$($tables.Count)" -ForegroundColor $(if ($found.Count -eq $tables.Count) { "Green" } else { "Yellow" })
@@ -104,7 +155,15 @@ if ($missingCols.Count -gt 0) {
     Write-Host "Colunas faltando em users: $($missingCols -join ', ')" -ForegroundColor Red
 }
 
-if ($missing.Count -eq 0 -and $missingCols.Count -eq 0) {
+if ($missingTokenCols.Count -gt 0) {
+    Write-Host "Colunas faltando em tokens: $($missingTokenCols -join ', ')" -ForegroundColor Red
+}
+
+if ($missingGuildCols.Count -gt 0) {
+    Write-Host "Colunas faltando em guilds: $($missingGuildCols -join ', ')" -ForegroundColor Red
+}
+
+if ($missing.Count -eq 0 -and $missingCols.Count -eq 0 -and $missingTokenCols.Count -eq 0 -and $missingGuildCols.Count -eq 0) {
     Write-Host ""
     Write-Host "[OK] Todas as migrations foram aplicadas corretamente!" -ForegroundColor Green
     

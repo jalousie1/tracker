@@ -21,8 +21,8 @@ func New(ctx context.Context, dsn string) (*DB, error) {
 	// prefer prepared statements safely via pgx automatic statement cache
 	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheStatement
 
-	cfg.MaxConns = 20
-	cfg.MinConns = 1
+	cfg.MaxConns = 100
+	cfg.MinConns = 5
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	cfg.MaxConnLifetime = 30 * time.Minute
 	cfg.HealthCheckPeriod = 30 * time.Second
@@ -45,5 +45,3 @@ func (d *DB) Close() {
 		d.Pool.Close()
 	}
 }
-
-

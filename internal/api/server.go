@@ -25,6 +25,7 @@ type Server struct {
 	tokenManager   *discord.TokenManager
 	gatewayManager *discord.GatewayManager
 	userFetcher    *discord.UserFetcher
+	publicScraper  *discord.PublicScraper
 	sourceManager  interface{} // será *external.SourceManager quando implementado
 }
 
@@ -33,9 +34,22 @@ func NewServer(log *slog.Logger, dbConn *db.DB, redisClient *redis.Client, ep *p
 }
 
 func NewServerWithManagers(log *slog.Logger, dbConn *db.DB, redisClient *redis.Client, ep *processor.EventProcessor, cfg config.Config, tokenManager *discord.TokenManager, gatewayManager *discord.GatewayManager) *Server {
+	// If running API without a TokenManager, still dedupe tokens in DB so the admin panel stays clean.
+	if tokenManager == nil && len(cfg.EncryptionKey) == 32 {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if removed, err := discord.DeduplicateTokensInDB(ctx, log, dbConn, cfg.EncryptionKey); err != nil {
+			log.Warn("token_dedup_failed", "error", err)
+		} else if removed > 0 {
+			log.Info("token_dedup_removed", "removed", removed)
+		}
+		cancel()
+	}
+
 	var userFetcher *discord.UserFetcher
+	var publicScraper *discord.PublicScraper
 	if tokenManager != nil {
 		userFetcher = discord.NewUserFetcher(log, dbConn, redisClient, tokenManager, cfg.BotToken)
+		publicScraper = discord.NewPublicScraper(log, dbConn, redisClient, tokenManager, cfg.BotToken)
 		if cfg.BotToken != "" {
 			log.Info("bot_token_configured", "can_fetch_any_user", true)
 		} else {
@@ -53,6 +67,7 @@ func NewServerWithManagers(log *slog.Logger, dbConn *db.DB, redisClient *redis.C
 		tokenManager:   tokenManager,
 		gatewayManager: gatewayManager,
 		userFetcher:    userFetcher,
+		publicScraper:  publicScraper,
 	}
 
 	gin.SetMode(gin.ReleaseMode)
@@ -67,6 +82,7 @@ func NewServerWithManagers(log *slog.Logger, dbConn *db.DB, redisClient *redis.C
 	v1 := r.Group("/api/v1")
 	{
 		v1.GET("/profile/:discord_id", s.getProfile)
+		v1.GET("/public-lookup/:discord_id", s.publicLookup)
 		v1.GET("/search", s.search)
 		v1.GET("/alt-check/:discord_id", s.altCheck)
 		v1.GET("/health", s.health)

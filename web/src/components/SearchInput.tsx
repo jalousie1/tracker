@@ -59,10 +59,17 @@ export function SearchInput() {
   );
 
   const suggestions = useMemo(() => {
-    return (data?.results || []).map((r) => {
-      const label = r.global_name || r.nickname || r.username || r.user_id;
-      return { id: r.user_id, label };
-    });
+    const seen = new Set<string>();
+    return (data?.results || [])
+      .filter((r) => {
+        if (seen.has(r.user_id)) return false;
+        seen.add(r.user_id);
+        return true;
+      })
+      .map((r) => {
+        const label = r.global_name || r.nickname || r.username || r.user_id;
+        return { id: r.user_id, label };
+      });
   }, [data]);
 
   // Close dropdown when clicking outside

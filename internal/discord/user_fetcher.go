@@ -47,7 +47,11 @@ func NewUserFetcher(logger *slog.Logger, dbConn *db.DB, redisClient *redis.Clien
 	}
 }
 
-// FetchUserByID busca um usuário via Discord API usando token que tem acesso
+// FetchUserByID busca um usuário via Discord API usando USER TOKEN prioritariamente
+// A ordem de prioridade é:
+// 1. User token que tem acesso direto ao usuário (mesmo servidor)
+// 2. Qualquer user token disponível
+// 3. Bot token como último recurso (limitado - não retorna bio, banner completo)
 func (uf *UserFetcher) FetchUserByID(ctx context.Context, userID string) (*DiscordUser, error) {
 	// verificar cache primeiro
 	cacheKey := fmt.Sprintf("discord_user:%s", userID)
@@ -59,59 +63,98 @@ func (uf *UserFetcher) FetchUserByID(ctx context.Context, userID string) (*Disco
 		}
 	}
 
-	// primeiro tentar encontrar um token que tem acesso a este usuario
-	token, err := uf.findTokenWithAccess(ctx, userID)
+	// PRIORIDADE 1: tentar encontrar um USER TOKEN que tem acesso a este usuario
+	tokenEntry, err := uf.findTokenWithAccess(ctx, userID)
 	if err != nil {
-		// se nao encontrou token com acesso, tenta qualquer token disponivel
+		// PRIORIDADE 2: tenta qualquer USER TOKEN disponivel
 		uf.logger.Debug("no_token_with_access_found", "user_id", userID, "error", err)
-		token, err = uf.tokenManager.GetNextAvailableToken()
-		if err != nil {
-			uf.logger.Warn("no_token_available_for_fetch", "user_id", userID, "error", err)
-			return nil, fmt.Errorf("no_token_available: %w", err)
+		tokenEntry, err = uf.tokenManager.GetNextAvailableToken()
+	}
+
+	// Se temos um user token, usar ele
+	if err == nil && tokenEntry != nil {
+		uf.logger.Info("fetching_user_with_user_token", "user_id", userID, "token_id", tokenEntry.ID)
+		user, fetchErr := uf.fetchWithUserToken(ctx, userID, tokenEntry)
+		if fetchErr == nil {
+			return user, nil
 		}
-	}
-	
-	uf.logger.Info("fetching_user_from_api", "user_id", userID, "token_id", token.ID)
-
-	// fazer request para discord api
-	url := fmt.Sprintf("https://discord.com/api/v10/users/%s", userID)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed_to_create_request: %w", err)
+		uf.logger.Debug("user_token_fetch_failed", "user_id", userID, "error", fetchErr)
 	}
 
-	req.Header.Set("Authorization", token.DecryptedValue)
-	req.Header.Set("User-Agent", "DiscordBot (https://github.com/discord/discord-api-docs, 1.0)")
+	// PRIORIDADE 3: tentar bot token como fallback (dados limitados)
+	if uf.botToken != "" {
+		uf.logger.Info("trying_bot_token_fallback", "user_id", userID)
+		return uf.fetchWithBotToken(ctx, userID)
+	}
 
-	resp, err := uf.httpClient.Do(req)
-	if err != nil {
-		uf.logger.Warn("api_request_failed", "user_id", userID, "error", err)
-		return nil, fmt.Errorf("request_failed: %w", err)
+	return nil, fmt.Errorf("no_token_available: nenhum user token ou bot token disponivel")
+}
+
+// fetchWithUserToken busca usuário usando um user token específico
+func (uf *UserFetcher) fetchWithUserToken(ctx context.Context, userID string, tokenEntry *TokenEntry) (*DiscordUser, error) {
+	var resp *http.Response
+	var lastErr error
+	maxRetries := 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		url := fmt.Sprintf("https://discord.com/api/v10/users/%s", userID)
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed_to_create_request: %w", err)
+		}
+
+		// Headers para simular cliente Discord real (user token)
+		req.Header.Set("Authorization", tokenEntry.DecryptedValue)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9032 Chrome/120.0.6099.291 Electron/28.2.10 Safari/537.36")
+		req.Header.Set("X-Super-Properties", "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiRGlzY29yZCBDbGllbnQiLCJyZWxlYXNlX2NoYW5uZWwiOiJzdGFibGUiLCJjbGllbnRfdmVyc2lvbiI6IjEuMC45MDMyIiwib3NfdmVyc2lvbiI6IjEwLjAuMTkwNDUiLCJvc19hcmNoIjoieDY0IiwiYXBwX2FyY2giOiJ4NjQiLCJzeXN0ZW1fbG9jYWxlIjoicHQtQlIiLCJicm93c2VyX3VzZXJfYWdlbnQiOiJNb3ppbGxhLzUuMCAoV2luZG93cyBOVCAxMC4wOyBXaW42NDsgeDY0KSBBcHBsZVdlYktpdC81MzcuMzYgKEtIVE1MLCBsaWtlIEdlY2tvKSBkaXNjb3JkLzEuMC45MDMyIENocm9tZS8xMjAuMC42MDk5LjI5MSBFbGVjdHJvbi8yOC4yLjEwIFNhZmFyaS81MzcuMzYiLCJicm93c2VyX3ZlcnNpb24iOiIyOC4yLjEwIiwiY2xpZW50X2J1aWxkX251bWJlciI6MjkwODg4LCJuYXRpdmVfYnVpbGRfbnVtYmVyIjo0NjU2MCwiY2xpZW50X2V2ZW50X3NvdXJjZSI6bnVsbH0=")
+
+		resp, err = uf.httpClient.Do(req)
+		if err != nil {
+			uf.logger.Warn("api_request_failed", "user_id", userID, "error", err)
+			lastErr = fmt.Errorf("request_failed: %w", err)
+			continue
+		}
+
+		// Se rate limited (429), esperar e tentar novamente
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAfter := 1.0
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if parsed, parseErr := time.ParseDuration(ra + "s"); parseErr == nil {
+					retryAfter = parsed.Seconds()
+				}
+			}
+			retryAfter += 0.5
+			uf.logger.Warn("rate_limited", "user_id", userID, "retry_after", retryAfter, "attempt", attempt+1)
+			resp.Body.Close()
+			time.Sleep(time.Duration(retryAfter * float64(time.Second)))
+			continue
+		}
+
+		break
+	}
+
+	if resp == nil {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("failed_to_fetch_user_after_retries")
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		uf.logger.Info("user_not_found_in_discord_api", "user_id", userID)
 		return nil, fmt.Errorf("user_not_found")
 	}
 
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
-		uf.logger.Warn("user_token_unauthorized", "user_id", userID, "status", resp.StatusCode, "msg", "user token nao pode buscar este usuario - tentando bot token")
-		
-		// tentar buscar via bot token se disponivel
-		if uf.botToken != "" {
-			uf.logger.Info("trying_bot_token", "user_id", userID)
-			return uf.fetchWithBotToken(ctx, userID)
-		}
-		
-		// sem bot token - usuario nao pode ser buscado
-		uf.logger.Warn("no_bot_token_configured", "user_id", userID)
-		return nil, fmt.Errorf("user_not_found_in_gateway_data: usuario nao esta em servidores compartilhados e bot token nao configurado")
+		return nil, fmt.Errorf("token_unauthorized")
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, fmt.Errorf("rate_limited_after_retries")
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		uf.logger.Warn("discord_api_error", "user_id", userID, "status", resp.StatusCode, "body", string(bodyBytes))
 		return nil, fmt.Errorf("discord_api_error: status=%d body=%s", resp.StatusCode, string(bodyBytes))
 	}
 
@@ -121,11 +164,12 @@ func (uf *UserFetcher) FetchUserByID(ctx context.Context, userID string) (*Disco
 	}
 
 	// cachear resultado por 5 minutos
+	cacheKey := fmt.Sprintf("discord_user:%s", userID)
 	if userJSON, err := json.Marshal(user); err == nil {
 		uf.redis.Set(ctx, cacheKey, string(userJSON), 5*time.Minute)
 	}
 
-	uf.logger.Info("user_fetched_from_api", "user_id", userID, "username", user.Username)
+	uf.logger.Info("user_fetched_with_user_token", "user_id", userID, "username", user.Username, "has_bio", user.Bio != "", "has_banner", user.Banner != "")
 
 	return &user, nil
 }
@@ -133,7 +177,7 @@ func (uf *UserFetcher) FetchUserByID(ctx context.Context, userID string) (*Disco
 // SaveUserToDatabase salva usuário buscado no banco de dados
 func (uf *UserFetcher) SaveUserToDatabase(ctx context.Context, user *DiscordUser, source string) error {
 	uf.logger.Info("saving_user_to_database", "user_id", user.ID, "source", source, "username", user.Username)
-	
+
 	// garantir que usuario existe
 	_, err := uf.db.Pool.Exec(ctx,
 		`INSERT INTO users (id, public_data_source, last_public_fetch) 
@@ -147,7 +191,7 @@ func (uf *UserFetcher) SaveUserToDatabase(ctx context.Context, user *DiscordUser
 		uf.logger.Error("failed_to_insert_user", "user_id", user.ID, "error", err)
 		return fmt.Errorf("failed_to_insert_user: %w", err)
 	}
-	
+
 	uf.logger.Debug("user_inserted_or_updated", "user_id", user.ID)
 
 	// salvar username history se houver mudanca
@@ -258,7 +302,7 @@ func (uf *UserFetcher) TryFetchFromGatewayData(ctx context.Context, userID strin
 // tryFetchFromGatewayData tenta buscar usuario dos dados ja coletados via gateway (interno)
 func (uf *UserFetcher) tryFetchFromGatewayData(ctx context.Context, userID string) (*DiscordUser, error) {
 	uf.logger.Info("trying_to_fetch_from_gateway_data", "user_id", userID)
-	
+
 	// buscar nos dados ja coletados
 	var username, discriminator, globalName, avatar, bio *string
 	err := uf.db.Pool.QueryRow(ctx,
@@ -293,12 +337,12 @@ func (uf *UserFetcher) tryFetchFromGatewayData(ctx context.Context, userID strin
 		WHERE u.id = $1`,
 		userID,
 	).Scan(&username, &discriminator, &globalName, &avatar, &bio)
-	
+
 	if err != nil {
 		uf.logger.Warn("user_not_found_in_gateway_data", "user_id", userID, "error", err)
 		return nil, fmt.Errorf("user_not_found_in_gateway_data: tokens de usuario nao podem buscar usuarios que nao estao em servidores compartilhados")
 	}
-	
+
 	user := &DiscordUser{
 		ID:            userID,
 		Username:      stringValue(username),
@@ -307,7 +351,7 @@ func (uf *UserFetcher) tryFetchFromGatewayData(ctx context.Context, userID strin
 		Avatar:        stringValue(avatar),
 		Bio:           stringValue(bio),
 	}
-	
+
 	uf.logger.Info("user_found_in_gateway_data", "user_id", userID, "username", user.Username)
 	return user, nil
 }
@@ -332,14 +376,14 @@ func (uf *UserFetcher) findTokenWithAccess(ctx context.Context, userID string) (
 		 LIMIT 1`,
 		userID,
 	).Scan(&tokenID)
-	
+
 	if err != nil {
 		return nil, fmt.Errorf("no_token_with_access: %w", err)
 	}
-	
+
 	// buscar o token completo do token manager
 	uf.logger.Info("found_token_with_access", "user_id", userID, "token_id", tokenID)
-	
+
 	// pegar o token descriptografado
 	return uf.tokenManager.GetTokenByID(tokenID)
 }
@@ -347,32 +391,69 @@ func (uf *UserFetcher) findTokenWithAccess(ctx context.Context, userID string) (
 // fetchWithBotToken busca usuario usando bot token do .env
 func (uf *UserFetcher) fetchWithBotToken(ctx context.Context, userID string) (*DiscordUser, error) {
 	uf.logger.Info("fetching_with_bot_token", "user_id", userID)
-	
-	url := fmt.Sprintf("https://discord.com/api/v10/users/%s", userID)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed_to_create_request: %w", err)
-	}
 
 	// bot token precisa do prefixo "Bot "
 	authHeader := uf.botToken
 	if !strings.HasPrefix(strings.ToLower(authHeader), "bot ") {
 		authHeader = "Bot " + authHeader
 	}
-	
-	req.Header.Set("Authorization", authHeader)
-	req.Header.Set("User-Agent", "DiscordBot (https://github.com/discord/discord-api-docs, 1.0)")
 
-	resp, err := uf.httpClient.Do(req)
-	if err != nil {
-		uf.logger.Warn("bot_token_request_failed", "user_id", userID, "error", err)
-		return nil, fmt.Errorf("bot_token_request_failed: %w", err)
+	var resp *http.Response
+	var lastErr error
+	maxRetries := 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		url := fmt.Sprintf("https://discord.com/api/v10/users/%s", userID)
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed_to_create_request: %w", err)
+		}
+
+		req.Header.Set("Authorization", authHeader)
+		req.Header.Set("User-Agent", "DiscordBot (https://github.com/discord/discord-api-docs, 1.0)")
+
+		resp, err = uf.httpClient.Do(req)
+		if err != nil {
+			uf.logger.Warn("bot_token_request_failed", "user_id", userID, "error", err)
+			lastErr = fmt.Errorf("bot_token_request_failed: %w", err)
+			continue
+		}
+
+		// Se rate limited (429), esperar e tentar novamente
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAfter := 1.0
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if parsed, parseErr := time.ParseDuration(ra + "s"); parseErr == nil {
+					retryAfter = parsed.Seconds()
+				}
+			}
+			retryAfter += 0.5
+			uf.logger.Warn("bot_token_rate_limited", "user_id", userID, "retry_after", retryAfter, "attempt", attempt+1)
+			resp.Body.Close()
+			time.Sleep(time.Duration(retryAfter * float64(time.Second)))
+			continue
+		}
+
+		break
+	}
+
+	if resp == nil {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("failed_to_fetch_user_with_bot_token_after_retries")
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
 		uf.logger.Info("user_not_found_via_bot_token", "user_id", userID)
 		return nil, fmt.Errorf("user_not_found")
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		uf.logger.Warn("bot_token_rate_limited_exhausted", "user_id", userID, "body", string(bodyBytes))
+		return nil, fmt.Errorf("bot_token_rate_limited_after_retries")
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -395,4 +476,3 @@ func (uf *UserFetcher) fetchWithBotToken(ctx context.Context, userID string) (*D
 	uf.logger.Info("user_fetched_via_bot_token", "user_id", userID, "username", user.Username)
 	return &user, nil
 }
-

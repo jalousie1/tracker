@@ -8,9 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
-
+	"identity-archive/internal/discord"
 	"identity-archive/internal/security"
+
+	"github.com/gin-gonic/gin"
 )
 
 func (s *Server) getProfile(c *gin.Context) {
@@ -23,18 +24,46 @@ func (s *Server) getProfile(c *gin.Context) {
 	ctx, cancel := s.ctx(c)
 	defer cancel()
 
+	refreshParam := strings.TrimSpace(c.Query("refresh"))
+	refresh := refreshParam == "1" || strings.EqualFold(refreshParam, "true") || strings.EqualFold(refreshParam, "yes")
+
 	// check cache
 	cacheKey := fmt.Sprintf("profile:%s", discordID)
-	if cached, err := s.redis.Get(ctx, cacheKey); err == nil && cached != "" {
-		c.Data(http.StatusOK, "application/json", []byte(cached))
-		c.Header("X-Cache", "HIT")
-		return
+	if !refresh {
+		if cached, err := s.redis.Get(ctx, cacheKey); err == nil && cached != "" {
+			c.Data(http.StatusOK, "application/json", []byte(cached))
+			c.Header("X-Cache", "HIT")
+			return
+		}
+	} else {
+		// ensure we don't serve stale cached payload
+		_ = s.redis.Del(ctx, cacheKey)
+		c.Header("X-Cache", "BYPASS")
+		// best-effort refresh of user snapshot (username/avatar/bio/connections)
+		if s.userFetcher != nil {
+			// Always try to fetch fresh data from Discord API first
+			if discordUser, fetchErr := s.userFetcher.FetchUserByID(ctx, discordID); fetchErr == nil && discordUser != nil {
+				if saveErr := s.userFetcher.SaveUserToDatabase(ctx, discordUser, "refresh_discord_api"); saveErr != nil {
+					s.log.Warn("refresh_api_save_failed", "user_id", discordID, "error", saveErr)
+				}
+			} else {
+				// If API fetch fails (e.g. 404 or no access), try to use existing gateway data
+				s.log.Debug("refresh_api_fetch_failed", "user_id", discordID, "error", fetchErr)
+				if gatewayUser, gatewayErr := s.userFetcher.TryFetchFromGatewayData(ctx, discordID); gatewayErr == nil && gatewayUser != nil {
+					if saveErr := s.userFetcher.SaveUserToDatabase(ctx, gatewayUser, "refresh_gateway"); saveErr != nil {
+						s.log.Warn("refresh_gateway_save_failed", "user_id", discordID, "error", saveErr)
+					}
+				}
+			}
+		}
 	}
 
 	// buscar perfil com agregação json
 	var userID, firstSeen, lastUpdated string
 	var usernameHistoryJSON, avatarHistoryJSON, bioHistoryJSON, connectionsJSON []byte
 	var nicknameHistoryJSON, guildsJSON, voiceHistoryJSON, presenceHistoryJSON, activityHistoryJSON []byte
+	var messagesJSON, voicePartnersJSON []byte
+	var bannerHistoryJSON, clanHistoryJSON, avatarDecorationHistoryJSON []byte
 
 	err := s.db.Pool.QueryRow(ctx,
 		`SELECT 
@@ -97,6 +126,7 @@ func (s *Server) getProfile(c *gin.Context) {
 					json_build_object(
 						'guild_id', nh.guild_id,
 						'guild_name', COALESCE(g.name, nh.guild_id),
+						'guild_icon', g.icon,
 						'nickname', nh.nickname,
 						'changed_at', nh.changed_at
 					) ORDER BY nh.changed_at DESC
@@ -111,6 +141,7 @@ func (s *Server) getProfile(c *gin.Context) {
 					json_build_object(
 						'guild_id', gm.guild_id,
 						'guild_name', COALESCE(g.name, gm.guild_id),
+						'guild_icon', g.icon,
 						'joined_at', gm.joined_at,
 						'last_seen_at', gm.last_seen_at
 					) ORDER BY gm.last_seen_at DESC
@@ -128,13 +159,16 @@ func (s *Server) getProfile(c *gin.Context) {
 					json_build_object(
 						'guild_id', vs.guild_id,
 						'guild_name', COALESCE(g.name, vs.guild_id),
+						'guild_icon', g.icon,
 						'channel_id', vs.channel_id,
 						'channel_name', vs.channel_name,
 						'joined_at', vs.joined_at,
 						'left_at', vs.left_at,
 						'duration_seconds', vs.duration_seconds,
 						'was_video', vs.was_video,
-						'was_streaming', vs.was_streaming
+						'was_streaming', vs.was_streaming,
+						'was_muted', vs.was_muted,
+						'was_deafened', vs.was_deafened
 					) ORDER BY vs.joined_at DESC
 				) FROM voice_sessions vs 
 				LEFT JOIN guilds g ON g.guild_id = vs.guild_id
@@ -162,17 +196,104 @@ func (s *Server) getProfile(c *gin.Context) {
 						'state', ah.state,
 						'type', ah.activity_type,
 						'started_at', ah.started_at,
-						'ended_at', ah.ended_at
+						'ended_at', ah.ended_at,
+						'url', ah.url,
+						'application_id', ah.application_id,
+						'spotify_track_id', ah.spotify_track_id,
+						'spotify_artist', ah.spotify_artist,
+						'spotify_album', ah.spotify_album
 					) ORDER BY ah.started_at DESC
 				) FROM activity_history ah 
 				WHERE ah.user_id = u.id 
 				LIMIT 100
 				), '[]'::json
-			) as activity_history
+			) as activity_history,
+			COALESCE(
+				(SELECT json_agg(
+					json_build_object(
+						'message_id', m.message_id,
+						'guild_id', m.guild_id,
+						'guild_name', COALESCE(g.name, m.guild_id),
+						'guild_icon', g.icon,
+						'channel_id', m.channel_id,
+						'channel_name', COALESCE(ch.name, m.channel_name),
+						'content', m.content,
+						'created_at', m.created_at,
+						'has_attachments', m.has_attachments,
+						'has_embeds', m.has_embeds,
+						'reply_to_user_id', m.reply_to_user_id
+					) ORDER BY m.created_at DESC
+				) FROM messages m
+				LEFT JOIN guilds g ON g.guild_id = m.guild_id
+				LEFT JOIN channels ch ON ch.channel_id = m.channel_id
+				WHERE m.user_id = u.id 
+				LIMIT 100
+				), '[]'::json
+			) as messages,
+			COALESCE(
+				(SELECT json_agg(
+					json_build_object(
+						'partner_id', vps.partner_id,
+						'partner_name', COALESCE(
+							(SELECT uh.global_name FROM username_history uh WHERE uh.user_id = vps.partner_id ORDER BY uh.changed_at DESC LIMIT 1),
+							(SELECT uh.username FROM username_history uh WHERE uh.user_id = vps.partner_id ORDER BY uh.changed_at DESC LIMIT 1),
+							vps.partner_id
+						),
+						'partner_avatar_hash', (SELECT ah.hash_avatar FROM avatar_history ah WHERE ah.user_id = vps.partner_id ORDER BY ah.changed_at DESC LIMIT 1),
+						'guild_id', vps.guild_id,
+						'guild_name', COALESCE(g.name, vps.guild_id),
+						'guild_icon', g.icon,
+						'session_count', vps.total_sessions,
+						'total_duration_seconds', vps.total_duration_seconds,
+						'last_session_at', vps.last_call_at
+					) ORDER BY vps.total_sessions DESC
+				) FROM voice_partner_stats vps
+				LEFT JOIN guilds g ON g.guild_id = vps.guild_id
+				WHERE vps.user_id = u.id 
+				LIMIT 50
+				), '[]'::json
+			) as voice_partners,
+			COALESCE(
+				(SELECT json_agg(
+					json_build_object(
+						'banner_hash', bh.banner_hash,
+						'banner_color', bh.banner_color,
+						'url_cdn', bh.url_cdn,
+						'changed_at', bh.changed_at
+					) ORDER BY bh.changed_at DESC
+				) FROM banner_history bh 
+				WHERE bh.user_id = u.id 
+				LIMIT 100
+				), '[]'::json
+			) as banner_history,
+			COALESCE(
+				(SELECT json_agg(
+					json_build_object(
+						'clan_tag', ch.clan_tag,
+						'badge', ch.badge,
+						'changed_at', ch.changed_at
+					) ORDER BY ch.changed_at DESC
+				) FROM clan_history ch 
+				WHERE ch.user_id = u.id 
+				LIMIT 100
+				), '[]'::json
+			) as clan_history,
+			COALESCE(
+				(SELECT json_agg(
+					json_build_object(
+						'decoration_asset', adh.decoration_asset,
+						'decoration_sku_id', adh.decoration_sku_id,
+						'changed_at', adh.changed_at
+					) ORDER BY adh.changed_at DESC
+				) FROM avatar_decoration_history adh 
+				WHERE adh.user_id = u.id 
+				LIMIT 100
+				), '[]'::json
+			) as avatar_decoration_history
 		FROM users u
 		WHERE u.id = $1`,
 		discordID,
-	).Scan(&userID, &firstSeen, &lastUpdated, &usernameHistoryJSON, &avatarHistoryJSON, &bioHistoryJSON, &connectionsJSON, &nicknameHistoryJSON, &guildsJSON, &voiceHistoryJSON, &presenceHistoryJSON, &activityHistoryJSON)
+	).Scan(&userID, &firstSeen, &lastUpdated, &usernameHistoryJSON, &avatarHistoryJSON, &bioHistoryJSON, &connectionsJSON, &nicknameHistoryJSON, &guildsJSON, &voiceHistoryJSON, &presenceHistoryJSON, &activityHistoryJSON, &messagesJSON, &voicePartnersJSON, &bannerHistoryJSON, &clanHistoryJSON, &avatarDecorationHistoryJSON)
 
 	if err != nil {
 		// usuario nao encontrado no banco
@@ -252,11 +373,13 @@ func (s *Server) getProfile(c *gin.Context) {
 						'[]'::json as guilds,
 						'[]'::json as voice_history,
 						'[]'::json as presence_history,
-						'[]'::json as activity_history
+						'[]'::json as activity_history,
+						'[]'::json as messages,
+						'[]'::json as voice_partners
 					FROM users u
 					WHERE u.id = $1`,
 					discordID,
-				).Scan(&userID, &firstSeen, &lastUpdated, &usernameHistoryJSON, &avatarHistoryJSON, &bioHistoryJSON, &connectionsJSON, &nicknameHistoryJSON, &guildsJSON, &voiceHistoryJSON, &presenceHistoryJSON, &activityHistoryJSON)
+				).Scan(&userID, &firstSeen, &lastUpdated, &usernameHistoryJSON, &avatarHistoryJSON, &bioHistoryJSON, &connectionsJSON, &nicknameHistoryJSON, &guildsJSON, &voiceHistoryJSON, &presenceHistoryJSON, &activityHistoryJSON, &messagesJSON, &voicePartnersJSON)
 
 				if err == nil {
 					s.log.Info("gateway_user_loaded_from_db", "user_id", discordID)
@@ -358,6 +481,18 @@ func (s *Server) getProfile(c *gin.Context) {
 						discordID,
 					).Scan(&userID, &firstSeen, &lastUpdated, &usernameHistoryJSON, &avatarHistoryJSON, &bioHistoryJSON, &connectionsJSON)
 
+					// set empty arrays for other fields
+					nicknameHistoryJSON = []byte("[]")
+					guildsJSON = []byte("[]")
+					voiceHistoryJSON = []byte("[]")
+					presenceHistoryJSON = []byte("[]")
+					activityHistoryJSON = []byte("[]")
+					messagesJSON = []byte("[]")
+					voicePartnersJSON = []byte("[]")
+					bannerHistoryJSON = []byte("[]")
+					clanHistoryJSON = []byte("[]")
+					avatarDecorationHistoryJSON = []byte("[]")
+
 					if err != nil {
 						// mesmo apos buscar e salvar, ainda nao conseguiu ler - retornar erro
 						s.log.Error("failed_to_read_after_save", "user_id", discordID, "error", err)
@@ -383,6 +518,8 @@ func (s *Server) getProfile(c *gin.Context) {
 
 	var usernameHistory, avatarHistory, bioHistory, connections []interface{}
 	var nicknameHistory, guilds, voiceHistory, presenceHistory, activityHistory []interface{}
+	var messages, voicePartners []interface{}
+	var bannerHistory, clanHistory, avatarDecorationHistory []interface{}
 
 	json.Unmarshal(usernameHistoryJSON, &usernameHistory)
 	json.Unmarshal(avatarHistoryJSON, &avatarHistory)
@@ -393,20 +530,30 @@ func (s *Server) getProfile(c *gin.Context) {
 	json.Unmarshal(voiceHistoryJSON, &voiceHistory)
 	json.Unmarshal(presenceHistoryJSON, &presenceHistory)
 	json.Unmarshal(activityHistoryJSON, &activityHistory)
+	json.Unmarshal(messagesJSON, &messages)
+	json.Unmarshal(voicePartnersJSON, &voicePartners)
+	json.Unmarshal(bannerHistoryJSON, &bannerHistory)
+	json.Unmarshal(clanHistoryJSON, &clanHistory)
+	json.Unmarshal(avatarDecorationHistoryJSON, &avatarDecorationHistory)
 
 	response := gin.H{
-		"discord_id":       userID,
-		"first_seen":       firstSeen,
-		"last_updated":     lastUpdated,
-		"username_history": usernameHistory,
-		"avatar_history":   avatarHistory,
-		"bio_history":      bioHistory,
-		"connections":      connections,
-		"nickname_history": nicknameHistory,
-		"guilds":           guilds,
-		"voice_history":    voiceHistory,
-		"presence_history": presenceHistory,
-		"activity_history": activityHistory,
+		"discord_id":                userID,
+		"first_seen":                firstSeen,
+		"last_updated":              lastUpdated,
+		"username_history":          usernameHistory,
+		"avatar_history":            avatarHistory,
+		"bio_history":               bioHistory,
+		"connections":               connections,
+		"nickname_history":          nicknameHistory,
+		"guilds":                    guilds,
+		"voice_history":             voiceHistory,
+		"presence_history":          presenceHistory,
+		"activity_history":          activityHistory,
+		"messages":                  messages,
+		"voice_partners":            voicePartners,
+		"banner_history":            bannerHistory,
+		"clan_history":              clanHistory,
+		"avatar_decoration_history": avatarDecorationHistory,
 	}
 
 	// cache response
@@ -724,11 +871,35 @@ func (s *Server) addToken(c *gin.Context) {
 		return
 	}
 
-	_, err = s.db.Pool.Exec(ctx,
-		`INSERT INTO tokens (token, token_encrypted, user_id, status, created_at) VALUES ($1, $2, $3, 'ativo', NOW())`,
-		encrypted, encrypted, req.OwnerUserID,
-	)
+	// token_fingerprint (se existir) evita tokens duplicados mesmo com cifragem aleatoria
+	hasFingerprint := false
+	_ = s.db.Pool.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'tokens' AND column_name = 'token_fingerprint'
+		)`,
+	).Scan(&hasFingerprint)
+
+	if hasFingerprint {
+		fingerprint := discord.TokenFingerprintForAPI(req.Token)
+		_, err = s.db.Pool.Exec(ctx,
+			`INSERT INTO tokens (token, token_encrypted, token_fingerprint, user_id, status, created_at)
+			 VALUES ($1, $2, $3, $4, 'ativo', NOW())`,
+			encrypted, encrypted, fingerprint, req.OwnerUserID,
+		)
+	} else {
+		_, err = s.db.Pool.Exec(ctx,
+			`INSERT INTO tokens (token, token_encrypted, user_id, status, created_at) VALUES ($1, $2, $3, 'ativo', NOW())`,
+			encrypted, encrypted, req.OwnerUserID,
+		)
+	}
 	if err != nil {
+		// avoid extra dependency: match by constraint/index name
+		if strings.Contains(err.Error(), "ux_tokens_token_fingerprint") || strings.Contains(err.Error(), "duplicate key") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "token_already_exists", "message": "token ja existe"}})
+			return
+		}
+		// Unique index will throw here if token already exists (fingerprint)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "db_error", "message": err.Error()}})
 		return
 	}
@@ -857,6 +1028,69 @@ func (s *Server) fetchUser(c *gin.Context) {
 			"avatar":        discordUser.Avatar,
 			"banner":        discordUser.Banner,
 			"bio":           discordUser.Bio,
+		},
+	})
+}
+
+// publicLookup busca dados públicos do Discord de fontes externas como discord.id
+func (s *Server) publicLookup(c *gin.Context) {
+	discordID := c.Param("discord_id")
+	if _, err := security.ParseSnowflake(discordID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "invalid_discord_id", "message": "discord_id invalido"}})
+		return
+	}
+
+	ctx, cancel := s.ctx(c)
+	defer cancel()
+
+	if s.publicScraper == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "service_unavailable", "message": "public scraper nao disponivel"}})
+		return
+	}
+
+	// buscar dados públicos de fontes externas
+	data, err := s.publicScraper.FetchPublicData(ctx, discordID)
+	if err != nil {
+		s.log.Debug("public_lookup_failed", "user_id", discordID, "error", err)
+		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"code": "not_found", "message": "dados publicos nao encontrados"}})
+		return
+	}
+
+	// salvar dados no banco
+	if saveErr := s.publicScraper.SavePublicData(ctx, data); saveErr != nil {
+		s.log.Warn("public_data_save_failed", "user_id", discordID, "error", saveErr)
+	}
+
+	// construir URLs de avatar e banner
+	var avatarURL, bannerURL string
+	if data.Avatar != "" {
+		ext := "png"
+		if len(data.Avatar) > 2 && data.Avatar[:2] == "a_" {
+			ext = "gif"
+		}
+		avatarURL = fmt.Sprintf("https://cdn.discordapp.com/avatars/%s/%s.%s", discordID, data.Avatar, ext)
+	}
+	if data.Banner != "" {
+		ext := "png"
+		if len(data.Banner) > 2 && data.Banner[:2] == "a_" {
+			ext = "gif"
+		}
+		bannerURL = fmt.Sprintf("https://cdn.discordapp.com/banners/%s/%s.%s", discordID, data.Banner, ext)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"source":  data.Source,
+		"user": gin.H{
+			"id":           data.ID,
+			"username":     data.Username,
+			"global_name":  data.GlobalName,
+			"avatar":       data.Avatar,
+			"avatar_url":   avatarURL,
+			"banner":       data.Banner,
+			"banner_url":   bannerURL,
+			"accent_color": data.AccentColor,
+			"public_flags": data.Flags,
 		},
 	})
 }

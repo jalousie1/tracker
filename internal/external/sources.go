@@ -4,21 +4,19 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-
-	"identity-archive/internal/discord"
 )
 
 // UserData representa dados coletados de uma fonte externa
 type UserData struct {
-	UserID         string
-	Username       string
-	Discriminator  string
-	GlobalName     string
-	Avatar         string
-	Banner         string
-	Bio            string
-	Source         string
-	Confidence     float64 // 0.0 a 1.0
+	UserID        string
+	Username      string
+	Discriminator string
+	GlobalName    string
+	Avatar        string
+	Banner        string
+	Bio           string
+	Source        string
+	Confidence    float64 // 0.0 a 1.0
 }
 
 // DataSource interface para diferentes fontes de dados
@@ -71,46 +69,6 @@ func (sm *SourceManager) FetchUser(ctx context.Context, userID string) (*UserDat
 	return nil, fmt.Errorf("user_not_found_in_any_source: %w", lastErr)
 }
 
-// DiscordLookupSource busca via Discord API
-type DiscordLookupSource struct {
-	userFetcher *discord.UserFetcher
-	logger      *slog.Logger
-}
-
-func NewDiscordLookupSource(logger *slog.Logger, userFetcher *discord.UserFetcher) *DiscordLookupSource {
-	return &DiscordLookupSource{
-		userFetcher: userFetcher,
-		logger:      logger,
-	}
-}
-
-func (d *DiscordLookupSource) Name() string {
-	return "discord_api"
-}
-
-func (d *DiscordLookupSource) Priority() int {
-	return 1 // maior prioridade
-}
-
-func (d *DiscordLookupSource) FetchUser(ctx context.Context, userID string) (*UserData, error) {
-	user, err := d.userFetcher.FetchUserByID(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-
-	return &UserData{
-		UserID:        user.ID,
-		Username:      user.Username,
-		Discriminator: user.Discriminator,
-		GlobalName:    user.GlobalName,
-		Avatar:        user.Avatar,
-		Banner:        user.Banner,
-		Bio:           user.Bio,
-		Source:        "discord_api",
-		Confidence:    0.95, // alta confianca pois vem direto da api
-	}, nil
-}
-
 // PlaceholderSource para futuras implementacoes
 type PlaceholderSource struct {
 	name     string
@@ -138,4 +96,3 @@ func (p *PlaceholderSource) FetchUser(ctx context.Context, userID string) (*User
 	// placeholder - retorna erro para indicar que nao implementado
 	return nil, fmt.Errorf("source_not_implemented: %s", p.name)
 }
-

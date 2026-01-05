@@ -42,14 +42,13 @@ type EventProcessor struct {
 	mu         sync.RWMutex
 }
 
-
 func NewEventProcessor(log *slog.Logger, dbConn *db.DB, redisClient *redis.Client, storageClient storage.StorageClient) *EventProcessor {
 	ep := &EventProcessor{
 		log:        log,
 		db:         dbConn,
 		redis:      redisClient,
-		storage:   storageClient,
-		eventQueue: make(chan Event, 10000),
+		storage:    storageClient,
+		eventQueue: make(chan Event, 500000),
 		workerPool: make([]*Worker, 0),
 	}
 
@@ -64,8 +63,9 @@ func (ep *EventProcessor) StartWorkers(workerCount int) {
 	if workerCount < 1 {
 		workerCount = 5
 	}
-	if workerCount > 10 {
-		workerCount = 10
+	// Keep a reasonable upper bound to avoid overwhelming Postgres.
+	if workerCount > 128 {
+		workerCount = 128
 	}
 
 	ep.mu.Lock()
@@ -128,14 +128,16 @@ func (ep *EventProcessor) StopWorkers() {
 
 func (ep *EventProcessor) ProcessEvent(ctx context.Context, event Event) error {
 	// Check for duplicate events (deduplication)
-	dedupKey := fmt.Sprintf("event:dedup:%s:%s:%d", event.Data["user_id"], event.Type, event.TokenID)
-	exists, _ := ep.redis.RDB().Exists(ctx, dedupKey).Result()
-	if exists > 0 {
-		return nil // Duplicate, skip
+	// NOTE: many Discord gateway events do not provide a top-level `user_id`.
+	// We must extract a stable identity per event type, otherwise we end up deduping unrelated
+	// events under an empty/"<nil>" key and silently dropping most traffic.
+	if dedupKey := ep.buildDedupKey(event); dedupKey != "" {
+		exists, err := ep.redis.RDB().Exists(ctx, dedupKey).Result()
+		if err == nil && exists > 0 {
+			return nil // Duplicate, skip
+		}
+		_ = ep.redis.RDB().Set(ctx, dedupKey, "1", 2*time.Second).Err()
 	}
-
-	// Set dedup key with 2s TTL
-	ep.redis.RDB().Set(ctx, dedupKey, "1", 2*time.Second)
 
 	switch event.Type {
 	case "USER_UPDATE":
@@ -154,10 +156,63 @@ func (ep *EventProcessor) ProcessEvent(ctx context.Context, event Event) error {
 		return ep.HandleTypingStart(ctx, event)
 	case "GUILD_MEMBER_ADD":
 		return ep.HandleGuildMemberAdd(ctx, event)
+	case "GUILD_CREATE":
+		return ep.HandleGuildCreate(ctx, event)
 	default:
 		ep.log.Debug("unknown_event_type", "type", event.Type)
 		return nil
 	}
+}
+
+func (ep *EventProcessor) buildDedupKey(event Event) string {
+	userID := extractEventUserID(event)
+	guildID := extractStringField(event.Data, "guild_id")
+
+	// Special-case chunk events: no user_id, but a `nonce` can identify a scrape session.
+	if userID == "" {
+		if nonce := extractStringField(event.Data, "nonce"); nonce != "" {
+			return fmt.Sprintf("event:dedup:nonce:%s:%s:%d", nonce, event.Type, event.TokenID)
+		}
+		return "" // don't dedup if we can't build a stable key
+	}
+
+	if guildID != "" {
+		return fmt.Sprintf("event:dedup:%s:%s:%s:%d", userID, guildID, event.Type, event.TokenID)
+	}
+	return fmt.Sprintf("event:dedup:%s:%s:%d", userID, event.Type, event.TokenID)
+}
+
+func extractEventUserID(event Event) string {
+	if v := extractStringField(event.Data, "user_id"); v != "" {
+		return v
+	}
+
+	switch event.Type {
+	case "PRESENCE_UPDATE", "GUILD_MEMBER_UPDATE", "GUILD_MEMBER_ADD":
+		if user, ok := event.Data["user"].(map[string]interface{}); ok {
+			return extractStringField(user, "id")
+		}
+	case "MESSAGE_CREATE":
+		if author, ok := event.Data["author"].(map[string]interface{}); ok {
+			return extractStringField(author, "id")
+		}
+	case "USER_UPDATE":
+		if user, ok := event.Data["user"].(map[string]interface{}); ok {
+			return extractStringField(user, "id")
+		}
+	}
+
+	return ""
+}
+
+func extractStringField(m map[string]interface{}, key string) string {
+	if m == nil {
+		return ""
+	}
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
 }
 
 func (ep *EventProcessor) sendToDLQ(ctx context.Context, event Event, errorMsg string) {
@@ -266,5 +321,3 @@ func eqPtr(a, b *string) bool {
 	}
 	return *a == *b
 }
-
-

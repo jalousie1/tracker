@@ -10,11 +10,15 @@ $ErrorActionPreference = "Continue"
 try {
     Write-Host "=== Identity Archive Tracker ===" -ForegroundColor Cyan
 
-    # ler ADMIN_SECRET_KEY do .env se existir
+    # ler ADMIN_SECRET_KEY e BOT_TOKEN do .env se existir
     $adminKey = "admin123"
+    $botToken = ""
     if (Test-Path ".\.env") {
         foreach ($line in (Get-Content ".\.env" -ErrorAction SilentlyContinue)) {
             $t = $line.Trim()
+            # ignorar comentarios e linhas vazias
+            if ($t.StartsWith('#') -or [string]::IsNullOrWhiteSpace($t)) { continue }
+            
             if ($t -match "^ADMIN_SECRET_KEY\s*=\s*(.+)$") {
                 $val = $Matches[1].Trim()
                 # remover aspas
@@ -23,6 +27,16 @@ try {
                 }
                 if (-not [string]::IsNullOrWhiteSpace($val)) {
                     $adminKey = $val
+                }
+            }
+            if ($t -match "^BOT_TOKEN\s*=\s*(.+)$") {
+                $val = $Matches[1].Trim()
+                # remover aspas
+                if (($val.StartsWith('"') -and $val.EndsWith('"')) -or ($val.StartsWith("'") -and $val.EndsWith("'"))) {
+                    $val = $val.Substring(1, $val.Length - 2)
+                }
+                if (-not [string]::IsNullOrWhiteSpace($val)) {
+                    $botToken = $val
                 }
             }
         }
@@ -68,12 +82,28 @@ try {
     Write-Host "Banco de dados OK" -ForegroundColor Green
 
     Write-Host "[3/4] Executando migrations..." -ForegroundColor Yellow
-    cmd /c "docker exec identityarchive-postgres psql -U postgres -d tracker -f /migrations/001_extend_tokens.sql" 1>$null 2>$null
-    cmd /c "docker exec identityarchive-postgres psql -U postgres -d tracker -f /migrations/002_add_guilds.sql" 1>$null 2>$null
-    cmd /c "docker exec identityarchive-postgres psql -U postgres -d tracker -f /migrations/003_add_alt_relationships.sql" 1>$null 2>$null
-    cmd /c "docker exec identityarchive-postgres psql -U postgres -d tracker -f /migrations/004_add_public_data.sql" 1>$null 2>$null
-    cmd /c "docker exec identityarchive-postgres psql -U postgres -d tracker -f /migrations/005_add_guild_members.sql" 1>$null 2>$null
-    cmd /c "docker exec identityarchive-postgres psql -U postgres -d tracker -f /migrations/006_complete_tracking.sql" 1>$null 2>$null
+    $migrationFiles = Get-ChildItem -Path ".\\migrations" -Filter "*.sql" -File |
+        Where-Object { $_.Name -match '^\d{3}_.+\.sql$' } |
+        Sort-Object Name
+
+    if (-not $migrationFiles -or $migrationFiles.Count -eq 0) {
+        Write-Host "[ERRO] Nenhuma migration encontrada em .\\migrations" -ForegroundColor Red
+        Write-Host "Pressione qualquer tecla para sair..."
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        exit 1
+    }
+
+    foreach ($mf in $migrationFiles) {
+        $containerPath = "/migrations/$($mf.Name)"
+        cmd /c "docker exec identityarchive-postgres psql -U postgres -d tracker -f $containerPath" 1>$null 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ERRO] Falha ao executar migration: $($mf.Name)" -ForegroundColor Red
+            Write-Host "Pressione qualquer tecla para sair..."
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            exit 1
+        }
+    }
+
     Write-Host "Migrations OK" -ForegroundColor Green
 
     Write-Host "[4/4] Iniciando API..." -ForegroundColor Yellow
@@ -100,10 +130,21 @@ try {
     $env:CORS_ORIGINS = "http://localhost:3000"
     $env:HTTP_ADDR = ":$ApiPort"
     $env:LOG_LEVEL = "info"
+
+    # knobs de performance / ingestao (ajuste se bater rate limit)
+    $env:EVENT_WORKER_COUNT = "25"
+    $env:DISCORD_ENABLE_GUILD_SUBSCRIPTIONS = "true"
+    # presences em chunk deixa o payload bem mais pesado e costuma causar 4008 (rate limited)
+    $env:DISCORD_REQUEST_MEMBER_PRESENCES = "false"
+    $env:DISCORD_SCRAPE_INITIAL_GUILD_MEMBERS = "true"
+    # manter baixo para nao estourar rate limit
+    $env:DISCORD_MAX_CONCURRENT_GUILD_SCRAPES = "1"
+    $env:DISCORD_SCRAPE_QUERY_DELAY_MS = "350"
     
     # BOT_TOKEN do .env (se estiver configurado)
-    if (-not [string]::IsNullOrWhiteSpace($env:BOT_TOKEN)) {
-        $tokenPreview = $env:BOT_TOKEN.Substring(0, [Math]::Min(20, $env:BOT_TOKEN.Length))
+    if (-not [string]::IsNullOrWhiteSpace($botToken)) {
+        $env:BOT_TOKEN = $botToken
+        $tokenPreview = $botToken.Substring(0, [Math]::Min(20, $botToken.Length))
         Write-Host "Bot Token: Configurado ($tokenPreview...)" -ForegroundColor Green
     } else {
         Write-Host "Bot Token: Nao configurado (busca limitada a servidores compartilhados)" -ForegroundColor Yellow

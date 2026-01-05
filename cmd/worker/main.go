@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -21,7 +20,7 @@ import (
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		panic(fmt.Sprintf("failed to load config: %v", err))
+		panic(err)
 	}
 
 	logger := logging.New(cfg.LogLevel)
@@ -94,13 +93,20 @@ func main() {
 
 	// Initialize EventProcessor
 	eventProcessor := processor.NewEventProcessor(logger, dbConn, redisClient, storageClient)
-	eventProcessor.StartWorkers(5)
+	eventProcessor.StartWorkers(cfg.EventWorkerCount)
 
 	// Initialize Scraper
-	scraper := discord.NewScraper(logger, dbConn, redisClient)
+	scraper := discord.NewScraperWithOptions(logger, dbConn, redisClient, discord.ScraperOptions{
+		QueryDelay: time.Duration(cfg.DiscordScrapeQueryDelayMs) * time.Millisecond,
+	})
 
 	// Initialize GatewayManager
-	gatewayManager := discord.NewGatewayManager(tokenManager, eventProcessor, scraper, logger, dbConn)
+	gatewayManager := discord.NewGatewayManagerWithOptions(tokenManager, eventProcessor, scraper, logger, dbConn, discord.GatewayManagerOptions{
+		EnableGuildSubscriptions:  cfg.DiscordEnableGuildSubscriptions,
+		RequestMemberPresences:    cfg.DiscordRequestMemberPresences,
+		ScrapeInitialGuildMembers: cfg.DiscordScrapeInitialGuildMembers,
+		MaxConcurrentGuildScrapes: cfg.DiscordMaxConcurrentGuildScrapes,
+	})
 
 	// Initialize AltDetector
 	altDetector := processor.NewAltDetector(logger, dbConn)
@@ -116,23 +122,8 @@ func main() {
 		logger.Warn("some_tokens_failed_to_connect", "error", err)
 	}
 
-	// Start scraping for each connected gateway
-	time.Sleep(5 * time.Second) // Wait for connections to stabilize
-	connections := gatewayManager.GetAllConnections()
-	for _, conn := range connections {
-		if conn != nil {
-			guilds := conn.GetGuilds()
-			for _, guildID := range guilds {
-				gid := guildID
-				c := conn
-				go func() {
-					if err := scraper.ScrapeGuildMembers(ctx, gid, c); err != nil {
-						logger.Warn("scrape_failed", "guild_id", gid, "error", err)
-					}
-				}()
-			}
-		}
-	}
+	// Scraping inicial (guild members) é disparado dentro do GatewayManager quando habilitado
+	// via cfg.DiscordScrapeInitialGuildMembers.
 
 	logger.Info("worker_started", "active_tokens", tokenManager.GetActiveTokenCount())
 
@@ -172,4 +163,3 @@ func main() {
 
 	logger.Info("worker_stopped")
 }
-
